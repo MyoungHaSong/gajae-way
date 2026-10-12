@@ -370,6 +370,132 @@ export class WorkLaneManager {
 				...(name === undefined ? {} : { name }),
 			});
 	}
+	/**
+	 * Settles an open attempt with a terminal reason when detected during recovery.
+	 * This ensures the attempt is settled atomically with the terminal state, preventing
+	 * the torn state where lane_jobs has endedAt but work_attempt_runtime is not settled (#401).
+	 */
+	#settleAttemptWithTerminal(opRef: string, reasonCode: WorkAttemptTerminalEvidence["reasonCode"]): boolean {
+		const runtime = this.#db.workAttemptGet(opRef);
+		if (!runtime || runtime.terminal || runtime.settledAt !== null) return false;
+		
+		const name = runtime.sessionKey.slice("work/task/".length);
+		const at = this.#at();
+		const terminal: WorkAttemptTerminalEvidence = {
+			kind: "local",
+			observedAt: at,
+			reasonCode,
+		};
+		const endState = workAttemptEndState(reasonCode);
+		const errorCode = reasonCode === "end_turn" ? undefined : reasonCode;
+		const output =
+			runtime.output.disposition === "pending"
+				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+				: runtime.output;
+		
+		try {
+			const record = this.#job(name, true);
+			if (!record || record.attempts.at(-1)?.opRef !== runtime.opRef) return false;
+			
+			const closed = closeAttempt({
+				record,
+				opRef,
+				endState,
+				errorCode,
+				endedAt: at,
+			});
+			
+			const text = reportText(name, endState, reasonCode, opRef, output);
+			let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
+			let admission: WorkAttemptAdmission | undefined;
+			
+			if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
+				decision = "wake_unaccepted";
+			} else if (runtime.output.knownSilence !== null) {
+				decision = "suppressed";
+			} else if (runtime.parent === null) {
+				decision = "no_target";
+			} else {
+				decision = "report";
+				if (runtime.parent.kind === "persona") {
+					const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId);
+					if (!fallbackPayload) return false;
+					const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
+					admission = {
+						kind: "persona",
+						row: {
+							messageId: runtime.reportId,
+							originKey: runtime.parent.originKey,
+							originRefJson: JSON.stringify(runtime.parent.origin),
+							body: text,
+							receivedAt: at,
+						},
+						fallbackPayload,
+						...(holdReason ? { holdReason } : {}),
+					};
+				} else {
+					const root = runtime.parent.root;
+					admission = {
+						kind: "lane",
+						report: {
+							reportId: runtime.reportId,
+							parentName: runtime.parent.name,
+							childName: name,
+							childOpRef: runtime.opRef,
+							body: text,
+							root,
+						},
+						fallbackPayload: root
+							? (buildDeliveryPayload(runtime.opRef, root.origin, text, runtime.deliveryId) ?? null)
+							: null,
+					};
+				}
+			}
+			
+			const settled = this.#db.workAttemptSettle(
+				opRef,
+				runtime.version,
+				closed,
+				{ decision, settledAt: at, terminal, ...(output !== runtime.output ? { output } : {}) },
+				admission,
+			);
+			
+			if (!settled) return false;
+			
+			this.#finishWaiters(opRef);
+			for (const payload of [settled.fallbackPayload, settled.childFallback]) {
+				if (!payload) continue;
+				try {
+					this.#options.deliverFallback?.(payload);
+				} catch {
+					console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+				}
+			}
+			
+			if (settled.runtime.decision === "reported" && settled.runtime.parent?.kind === "persona") {
+				try {
+					this.#options.notifyPersona?.(settled.runtime.parent.originKey);
+				} catch {
+					console.error(`work_persona_nudge_failed origin=${settled.runtime.parent.originKey}`);
+				}
+			}
+			
+			const parents = new Set([name]);
+			if (settled.runtime.parent?.kind === "lane") parents.add(settled.runtime.parent.name);
+			for (const parentName of parents) {
+				void this.#drainLaneReports(parentName).catch(() => {
+					console.error(`lane_report_drain_failed parent=${parentName}`);
+				});
+			}
+			
+			return true;
+		} catch (error) {
+			// If settlement fails due to torn state or other issues, log it
+			console.error(`work_settle_terminal_failed opRef=${opRef} reasonCode=${reasonCode} error=${failureReason(error)}`);
+			return false;
+		}
+	}
+
 	#latestRuntime(name: string): WorkAttemptRuntime | undefined {
 		const opRef = this.#job(name)?.attempts.at(-1)?.opRef;
 		return opRef ? this.#db.workAttemptGet(opRef) : undefined;
@@ -1595,19 +1721,27 @@ export class WorkLaneManager {
 					// The router itself answered session_unavailable for the operation
 					// and inspect agrees: the host died with the attempt open.
 					const hostLost = isSessionUnavailable(statusError) && (live.disowned || live.live === false);
+					const reasonCode: WorkAttemptTerminalEvidence["reasonCode"] = hostLost
+						? "host_lost"
+						: live.disowned || !this.#binding(runtime)
+							? "session_disowned"
+							: live.live === false
+								? "session_dead"
+								: "recovery_indeterminate";
 					if (hostLost)
 						console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=recovery`);
+					
+					// Try to settle immediately to prevent torn state (#401)
+					if (this.#settleAttemptWithTerminal(runtime.opRef, reasonCode)) {
+						continue;
+					}
+					
+					// If settlement fails, mark the terminal and let the observer handle it
 					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
 						terminal: {
 							kind: "local",
 							observedAt: this.#at(),
-							reasonCode: hostLost
-								? "host_lost"
-								: live.disowned || !this.#binding(runtime)
-									? "session_disowned"
-									: live.live === false
-										? "session_dead"
-										: "recovery_indeterminate",
+							reasonCode,
 						},
 					});
 					this.#schedule(observer, 0);

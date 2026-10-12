@@ -1928,6 +1928,7 @@ test("#308 host loss settles the open attempt as host_lost; resume and retire th
 	f.port.setSessionState(result.sessionId, { live: false });
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).not.toBeNull();
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.job().attempts[0]?.errorCode).toBe("host_lost");
 	expect(f.job().state).toBe("attempt_ended");
@@ -2007,8 +2008,30 @@ test("#308 restart recovery classifies a router-disowned open attempt as host_lo
 	await f.restart();
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).not.toBeNull();
 	expect(f.job().state).toBe("attempt_ended");
+	expect(f.job().attempts[0]?.endedAt).not.toBeUndefined();
 	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
+});
+
+test("#401 recovery settles host_lost attempts atomically to prevent torn state", async () => {
+	const f = await fixture();
+	const result = await started(f);
+	await f.manager.stop();
+	f.port.status = async () => {
+		throw sessionUnavailable();
+	};
+	f.port.setSessionState(result.sessionId, { live: false });
+	await f.restart();
+	await until(() => f.db.workAttemptOpen().length === 0);
+	// Verify that both lane_jobs and work_attempt_runtime were updated atomically
+	const runtime = f.db.workAttemptGet(result.opRef)!;
+	const job = f.job();
+	expect(runtime.terminal?.reasonCode).toBe("host_lost");
+	expect(runtime.settledAt).not.toBeNull();
+	expect(job.attempts[0]?.endedAt).toBe(runtime.settledAt);
+	// Verify that reading the lane doesn't throw
+	expect(() => f.db.workAttemptGet(result.opRef)).not.toThrow();
 });
 
 test("#308 streamed turn frames advance lane activity past the attempt start", async () => {
