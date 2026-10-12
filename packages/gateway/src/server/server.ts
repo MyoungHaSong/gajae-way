@@ -2627,9 +2627,12 @@ async function createInboundTurnLifecycle(
 		if (fileReply) message = fileReply.body;
 		// Control tokens are internal protocol, never user-visible. Models routinely
 		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
-		// part is judged by whether it CONTAINS the token, not whether it equals it:
-		// any part carrying a silence token is dropped whole, and [REPLY:id] is
-		// honoured wherever it appears and always stripped from the delivered text.
+		// part is judged by whether it CLOSES with the token, not whether it equals
+		// it: a part whose last line ends in a silence token is dropped whole. A
+		// token merely mentioned (mid-sentence, in code, or followed by more prose)
+		// is prose: a persona explaining its own rules lost a whole answer when any
+		// occurrence counted (live, 2026-10-12). [REPLY:id] is honoured wherever it
+		// appears and always stripped from the delivered text.
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())

@@ -201,13 +201,40 @@ describe("origin normalization", () => {
 describe("silence tokens", () => {
 	for (const text of [
 		"preamble [SILENT]",
-		"preamble\n[SILENT]\npostscript",
+		"preamble\n[SILENT]",
+		"...nothing to add.\n\n[SILENT]",
 		"preamble [silent]",
-		"preamble\n[silent]\npostscript",
+		"preamble\n  [silent]  \n\n",
+		"no space before the closing marker[SILENT]",
 	]) {
-		test(`recognizes embedded marker ${JSON.stringify(text)}`, () => {
+		test(`recognizes a closing embedded marker ${JSON.stringify(text)}`, () => {
 			expect(containsSilenceToken(text)).toBe(true);
 			expect(isSilenceToken(text)).toBe(false);
+		});
+	}
+
+	// Only control tokens, no prose: a misplaced token must not reach the room.
+	for (const text of ["[SILENT][REACT:🔥]", "[REACT:👍] [SILENT]", "[REPLY:123]\n[SILENT]"]) {
+		test(`a control-tokens-only part carrying the marker is silent: ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(true);
+		});
+	}
+
+	// A marker that does not close the part is a mention: a persona explaining
+	// its own rules lost a 1,590-character answer as {"none":"silent"} because
+	// any occurrence counted (live, 2026-10-12).
+	for (const text of [
+		"Rule: reply with exactly [SILENT] when the message is not for you, else answer.",
+		"The [SILENT] token suppresses delivery.",
+		"[SILENT] This is a status update",
+		"[silent] lowercase marker with text",
+		"preamble\n[SILENT]\npostscript",
+		"I opted out.\n[SILENT]\nActually, one more thing.",
+		"[SILENT] see the docs",
+	]) {
+		test(`a marker that is not the closing token is prose: ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(false);
+			expect(isSilentOutput(text)).toBe(false);
 		});
 	}
 
@@ -271,17 +298,23 @@ describe("isSilentOutput", () => {
 		expect(isSilentOutput("  silent  ")).toBe(true);
 	});
 
-	test("embedded [SILENT] or [silent] markers anywhere silence (issue #338: propagate.ts must use this)", () => {
-		// Leading markers
-		expect(isSilentOutput("[SILENT] This is a status update")).toBe(true);
-		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(true);
-		expect(isSilentOutput("[silent] lowercase marker with text")).toBe(true);
-		// Trailing markers
+	test("a closing [SILENT] or [silent] marker silences (issue #338: propagate.ts must use this)", () => {
 		expect(isSilentOutput("Nothing to report. [SILENT]")).toBe(true);
 		expect(isSilentOutput("Finished processing. [silent]")).toBe(true);
-		// Mid-text markers
-		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(true);
-		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(true);
+		expect(isSilentOutput("Pure chatter, nothing to add.\n\n[SILENT]")).toBe(true);
+	});
+
+	test("a mentioned [SILENT] marker is prose, not a directive", () => {
+		// Leading marker with narration after it
+		expect(isSilentOutput("[SILENT] This is a status update")).toBe(false);
+		expect(isSilentOutput("[SILENT]\nMultiline status")).toBe(false);
+		// Mid-sentence
+		expect(isSilentOutput("Please see [SILENT] in docs")).toBe(false);
+		expect(isSilentOutput("This bug is about [SILENT] marker support")).toBe(false);
+		// In a code span
+		expect(isSilentOutput("reply with `[SILENT]` to stay quiet")).toBe(false);
+		// On its own line but followed by more prose
+		expect(isSilentOutput("Opting out.\n[SILENT]\nOn second thought, here is the answer.")).toBe(false);
 	});
 
 	test("non-silent text is not silent", () => {
