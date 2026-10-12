@@ -545,6 +545,40 @@ export class MonitorPropagator {
 					// are reclaimed here (the dispatcher acquires its own lease).
 					if (this.#database.monitorEventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
+						// #187: Before marking as terminal, check if the authoring turn is still running.
+						// If it is, don't mark as failed_no_retry — the turn may still complete.
+						const monitor = this.#registry.get(row.monitor_id);
+						if (monitor) {
+							const sessionOrigin = monitorSessionOrigin(monitor.monitorId, row.event_type);
+							const sessionOriginKey = originKey(sessionOrigin);
+							const sessionRecord = this.#database.getSessionRecord(sessionOriginKey);
+							const authoringTurnRaw = this.#database.metaGet(authoringTurnKey(row.event_id));
+							if (authoringTurnRaw && sessionRecord) {
+								// Turn key exists and session exists; check if the turn is truly in flight.
+								try {
+									const authoringTurn = JSON.parse(authoringTurnRaw) as {
+										sessionId?: unknown;
+										opRef?: unknown;
+										eventIds?: unknown;
+									};
+									if (authoringTurn.sessionId === sessionRecord.session_id && typeof authoringTurn.opRef === "string") {
+										// Verify the turn is actually in flight (not stale)
+										const report = await this.#sessionPort.status({
+											sessionId: sessionRecord.session_id,
+											repo: this.#repo,
+											opRef: authoringTurn.opRef,
+										});
+										const state = report.status.status;
+										if (state === "accepted" || state === "in_flight") {
+											// Turn is actually still running; skip terminal marking.
+											continue;
+										}
+									}
+								} catch {
+									// Status check failed; assume turn is not running and proceed with terminal marking.
+								}
+							}
+						}
 						const failedRow = this.#database.withTransaction(() => {
 							const current = this.#database.monitorEventGet(row.event_id, true);
 							if (!current) return undefined;
