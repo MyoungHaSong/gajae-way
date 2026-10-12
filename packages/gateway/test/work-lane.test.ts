@@ -2008,9 +2008,9 @@ test("#308 restart recovery classifies a router-disowned open attempt as host_lo
 	await f.restart();
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
-	expect(f.db.workAttemptGet(result.opRef)?.settledAt).not.toBeNull();
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeTruthy();
 	expect(f.job().state).toBe("attempt_ended");
-	expect(f.job().attempts[0]?.endedAt).not.toBeUndefined();
+	expect(f.job().attempts[0]?.endedAt).toBeTruthy();
 	expect(await f.lanes.retire("a", "operator")).toMatchObject({ retired: true });
 });
 
@@ -2029,7 +2029,7 @@ test("#401 recovery settles host_lost attempts atomically to prevent torn state"
 	const job = f.job();
 	expect(runtime.terminal?.reasonCode).toBe("host_lost");
 	expect(runtime.settledAt).not.toBeNull();
-	expect(job.attempts[0]?.endedAt).toBe(runtime.settledAt);
+	expect(job.attempts[0]?.endedAt).toBe(runtime.settledAt ?? undefined);
 	// Verify that reading the lane doesn't throw
 	expect(() => f.db.workAttemptGet(result.opRef)).not.toThrow();
 });
