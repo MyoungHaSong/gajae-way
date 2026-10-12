@@ -561,10 +561,10 @@ export class MonitorPropagator {
 										opRef?: unknown;
 										eventIds?: unknown;
 									};
-									if (authoringTurn.sessionId === sessionRecord.session_id && typeof authoringTurn.opRef === "string") {
+									if (authoringTurn.sessionId === sessionRecord.sessionId && typeof authoringTurn.opRef === "string") {
 										// Verify the turn is actually in flight (not stale)
 										const report = await this.#sessionPort.status({
-											sessionId: sessionRecord.session_id,
+											sessionId: sessionRecord.sessionId,
 											repo: this.#repo,
 											opRef: authoringTurn.opRef,
 										});

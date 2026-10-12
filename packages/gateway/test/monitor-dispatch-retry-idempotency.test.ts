@@ -27,8 +27,9 @@ test("issue #187: dispatch retry reuses authoring turn if request fails after pr
 		const sessionPort: Partial<SessionPort> = {
 			bind: async () => ({
 				sessionId: "test-session-123",
+				originKey: "test-origin",
 				epoch: 0,
-				startupModelApplied: false,
+				repo: join(home, "workspace"),
 			}),
 			request: async (input: SessionRequestInput): Promise<SessionRequestResult> => {
 				requestCount++;
@@ -42,11 +43,23 @@ test("issue #187: dispatch retry reuses authoring turn if request fails after pr
 				}
 
 				// Second request succeeds
+				const eventId = input.text.match(/"eventId":"([^"]+)"/)?.[1] ?? "unknown";
 				return {
-					receipt: { text: "ok", messageId: "test-msg-1", threadId: "test-thread" },
-					status: { status: "terminal_ok", operationId: input.opRef },
+					receipt: {
+						sessionId: "test-session-123",
+						operationRef: input.opRef,
+						acceptedAt: new Date().toISOString(),
+						taskKey: "monitor",
+					},
+					status: {
+						operationRef: input.opRef,
+						status: { status: "terminal_ok" },
+						summaryCompleted: true,
+					},
 					assistant: {
-						text: '[{"eventId":"' + input.text.match(/"eventId":"([^"]+)"/)?.[1] + '","note":"test note"}]',
+						text: `[{"eventId":"${eventId}","note":"test note"}]`,
+						pages: 1,
+						complete: true,
 					},
 				};
 			},
