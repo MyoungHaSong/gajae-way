@@ -299,6 +299,92 @@ async function applyConfigReload(
 	return result;
 }
 
+/**
+ * Prune expired memory operations and cap the map size to prevent unbounded growth.
+ * Extracted for testability; called periodically during operation and in tests.
+ */
+export function pruneExpiredMemoryOps(memoryOps: Map<string, MemoryOpStatus>, nowMs: number): void {
+	// Remove expired operations (past their 24h TTL)
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status !== "pending" && new Date(op.expireAt).getTime() < nowMs) {
+			memoryOps.delete(opRef);
+		}
+	}
+
+	// Cap the map size to prevent unbounded memory growth
+	if (memoryOps.size > 10_000) {
+		const entries = Array.from(memoryOps.entries())
+			.filter(([, op]) => op.status !== "pending")
+			.sort(([, a], [, b]) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+		for (const [opRef] of entries.slice(0, memoryOps.size - 5_000)) {
+			memoryOps.delete(opRef);
+		}
+	}
+}
+
+/**
+ * Get or create a pending memory operation of a specific kind.
+ * Returns opRef and created flag: created=true means a new operation was just created
+ * and the caller should start the sweep; created=false means it's reusing an existing pending op.
+ * Ensures kind-specific deduplication: audit pending ops never dedup autolink requests and vice versa.
+ */
+export function getOrCreatePendingMemoryOp(
+	memoryOps: Map<string, MemoryOpStatus>,
+	kind: "audit" | "autolink",
+): { opRef: string; created: boolean } {
+	// Check for existing pending operation of the SAME kind
+	for (const [opRef, op] of Array.from(memoryOps.entries())) {
+		if (op.status === "pending") {
+			// Distinguish by opRef prefix: gw-ma- (audit), gw-ml- (autolink)
+			const opKind = opRef.startsWith("gw-ma-") ? "audit" : "autolink";
+			if (opKind === kind) {
+				return { opRef, created: false }; // Reuse existing pending operation of same kind
+			}
+		}
+	}
+
+	// No pending operation of this kind; create new one
+	const prefix = kind === "audit" ? "gw-ma" : "gw-ml";
+	const opRef = `${prefix}-${crypto.randomUUID()}`;
+	const started = new Date().toISOString();
+	const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+	memoryOps.set(opRef, { status: "pending", startedAt: started, expireAt });
+	return { opRef, created: true };
+}
+
+interface MemoryOpStatus {
+	status: "pending" | "completed" | "failed";
+	result?: unknown;
+	error?: string;
+	elapsedMs?: number;
+	startedAt: string;
+	expireAt: string; // For pruning old operations
+}
+
+function startMemoryOperation(runtime: Runtime, opRef: string, work: () => Promise<unknown>): void {
+	let task: Promise<void>;
+	task = Promise.resolve()
+		.then(work)
+		.then((result) => {
+			const operation = runtime.memoryOps.get(opRef);
+			if (operation) {
+				operation.status = "completed";
+				operation.result = result;
+				operation.elapsedMs = Math.max(0, Date.now() - Date.parse(operation.startedAt));
+			}
+		})
+		.catch((error: unknown) => {
+			const operation = runtime.memoryOps.get(opRef);
+			if (operation) {
+				operation.status = "failed";
+				operation.error = diagnostic(error);
+				operation.elapsedMs = Math.max(0, Date.now() - Date.parse(operation.startedAt));
+			}
+		})
+		.finally(() => runtime.memoryOperationTasks.delete(task));
+	runtime.memoryOperationTasks.add(task);
+}
+
 interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
@@ -310,6 +396,10 @@ interface Runtime {
 	stop?: (reason?: string) => Promise<void>;
 	readonly connections: Set<Connection>;
 	readonly memory: MemoryClosureQueue;
+	/** Tracked memory operations (autolink, audit) keyed by opRef. */
+	readonly memoryOps: Map<string, MemoryOpStatus>;
+	/** Running memory operations are drained before gateway shutdown. */
+	readonly memoryOperationTasks: Set<Promise<void>>;
 	readonly registry: MonitorRegistry;
 	readonly monitors: MonitorPropagator;
 	readonly monitorRuntime: MonitorRuntime;
@@ -318,6 +408,7 @@ interface Runtime {
 	readonly panelExpirySweepTimer: ReturnType<typeof setInterval>;
 	readonly stallTimer: ReturnType<typeof setInterval>;
 	readonly contextMaintenanceTimer: ReturnType<typeof setInterval>;
+	readonly memoryOpsCleanupTimer: ReturnType<typeof setInterval>;
 	readonly stopRetention: () => void;
 	readonly stopBrokerGenerationListener?: () => void;
 	/** Per-turn / per-message reaction caps shared by chat.react and the reply-token path. */
@@ -370,6 +461,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
 			// Stop accepting new sockets first, but keep existing sockets alive. Then
 			// quiesce every admitted producer before taking the final writer snapshot.
@@ -377,6 +469,7 @@ export async function startUnixServer(options: GatewayServerOptions): Promise<Ga
 			runtime.stopBrokerGenerationListener?.();
 			await runtime.work.stop();
 			await Promise.all([...runtime.requests]);
+			await Promise.all([...runtime.memoryOperationTasks]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
@@ -489,6 +582,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			clearInterval(runtime.panelExpirySweepTimer);
 			clearInterval(runtime.stallTimer);
 			clearInterval(runtime.contextMaintenanceTimer);
+			clearInterval(runtime.memoryOpsCleanupTimer);
 			runtime.stopRetention();
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "gateway.stopping", payload: { reason } });
 			runtime.stopBrokerGenerationListener?.();
@@ -496,6 +590,7 @@ export function startStdioServer(options: GatewayServerOptions): GatewayServer {
 			// Same producer quiescence as the Unix server: in-flight stdio requests are
 			// tracked and awaited before persona/tail/broker teardown.
 			await Promise.all([...runtime.requests]);
+			await Promise.all([...runtime.memoryOperationTasks]);
 			await runtime.personaSessions.drain();
 			await runtime.personaSessions.stop();
 			await runtime.monitorRuntime.stop();
@@ -752,6 +847,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		60 * 60 * 1000,
 	);
+	// Clean up expired memory operations to prevent unbounded growth (#473)
+	const memoryOpsCleanupTimer = setInterval(
+		() => {
+			try {
+				pruneExpiredMemoryOps(runtime.memoryOps, Date.now());
+			} catch (error) {
+				console.error(`memory operations cleanup failed: ${diagnostic(error)}`);
+			}
+		},
+		5 * 60 * 1000,
+	); // Every 5 minutes
 	// History GC: bounded batches with a macrotask yield between them so a large
 	// backlog never holds the event loop (and the single writer) for long.
 	let retentionRunning = false;
@@ -818,6 +924,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		panelExpirySweepTimer,
 		stallTimer,
 		contextMaintenanceTimer,
+		memoryOpsCleanupTimer,
 		stopRetention,
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
@@ -836,6 +943,8 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		inbound,
 		requests: new Set(),
 		permissionPanels,
+		memoryOps: new Map(),
+		memoryOperationTasks: new Set(),
 	};
 	void work.recover().catch((error: unknown) => console.error(`work startup recovery failed: ${diagnostic(error)}`));
 	void personaSessions
@@ -1371,23 +1480,55 @@ async function handleRequest(
 			return;
 		}
 		case "memory.audit": {
-			const root = await initializeMemory(options.config.home);
-			const issues = await validateMemory(root);
+			// Track async memory operations to prevent client timeouts during long operations (#473).
+			// Kind-specific deduplication: audit requests don't dedup with autolink operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "audit");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { opRef },
+				});
+				return;
+			}
+
+			startMemoryOperation(runtime, opRef, async () => {
+				const root = await initializeMemory(options.config.home);
+				const issues = await validateMemory(root);
+				return { ok: issues.length === 0, issues };
+			});
+
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { ok: issues.length === 0, issues },
+				result: { opRef },
 			});
 			return;
 		}
 		case "memory.autolink": {
+			// Track async memory operations to prevent client timeouts during long operations (#473).
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
 			// Runs through shared lock to serialize with intent commits (#341).
-			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root, runtime.memory);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
+			// Kind-specific deduplication: autolink requests don't dedup with audit operations.
+			const { opRef, created } = getOrCreatePendingMemoryOp(runtime.memoryOps, "autolink");
+
+			if (!created) {
+				// Already running; return existing opRef
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
+				return;
+			}
+
+			startMemoryOperation(runtime, opRef, async () => {
+				const root = await initializeMemory(options.config.home);
+				return autolinkCorpus(root, runtime.memory);
+			});
+
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { opRef } });
 			return;
 		}
 		case "memory.search": {
@@ -1400,6 +1541,24 @@ async function handleRequest(
 				type: "response",
 				id: request.id,
 				result: { hits: await searchMemory(root, params.query, limit) },
+			});
+			return;
+		}
+		case "memory.status": {
+			const params = (request.params ?? {}) as { opRef?: unknown };
+			if (typeof params.opRef !== "string") throw new ProtocolError("invalid_params", "memory.status requires opRef");
+			const op = runtime.memoryOps.get(params.opRef);
+			if (!op) throw new ProtocolError("invalid_params", `unknown opRef: ${params.opRef}`);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: {
+					status: op.status,
+					elapsedMs: op.elapsedMs ?? Math.max(0, Date.now() - Date.parse(op.startedAt)),
+					...(op.result !== undefined ? { result: op.result } : {}),
+					...(op.error ? { error: op.error } : {}),
+				},
 			});
 			return;
 		}

@@ -856,7 +856,7 @@ test("a healthy turn clears consecutive internal submission failures", async () 
 	expect(logs.some((line) => line.startsWith("session_reset_after_failed_turn "))).toBe(false);
 });
 
-test("repeated submission failures respect the reset cap and log it once per session", async () => {
+test("repeated submission failures bypass the reset cap to recover from stuck sessions (#477)", async () => {
 	const port = new ScriptedSessionPort({
 		onBind: (input) => `session-e${input.epoch}`,
 		onSend: (input, scripted) =>
@@ -869,21 +869,13 @@ test("repeated submission failures respect the reset cap and log it once per ses
 	await harness(port, {}, (line) => logs.push(line));
 
 	const sends: (typeof port.sends)[number][] = [];
-	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `capped-submission-${index + 1}`));
-	const capped = sends[3];
-	if (!capped) throw new Error("reset cap failure was not recorded");
+	for (let index = 0; index < 6; index++) sends.push(await settleFailedInbound(port, `stuck-submission-${index + 1}`));
 
 	expect(sends.slice(0, 2).map((send) => send.sessionId)).toEqual(["session-e0", "session-e0"]);
-	expect(sends.slice(2).map((send) => send.sessionId)).toEqual([
-		"session-e1",
-		"session-e1",
-		"session-e1",
-		"session-e1",
-	]);
-	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(1);
-	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([
-		`failed_turn_reset_capped origin=${KEY} epoch=1 session=session-e1 opRef=${capped.opRef} reason=repeated_submission_failure`,
-	]);
+	expect(sends.slice(2, 4).map((send) => send.sessionId)).toEqual(["session-e1", "session-e1"]);
+	expect(sends.slice(4, 6).map((send) => send.sessionId)).toEqual(["session-e2", "session-e2"]);
+	expect(database?.bindings.getSessionRecord(KEY)?.epoch).toBe(3);
+	expect(logs.filter((line) => line.startsWith("failed_turn_reset_capped "))).toEqual([]);
 });
 
 const SUBMISSION_BUSY = {

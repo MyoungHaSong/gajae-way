@@ -143,9 +143,13 @@ Run the validator through the daemon:
 
 ```sh
 gajaeway memory audit
+# If the CLI exits 75, check the operation using the printed reference:
+gajaeway memory status <opRef>
 ```
 
-It returns JSON issues and exits non-zero when memory is not structurally sound. Its diagnostic codes are:
+Audit and autolink start as tracked operations, so a client request timeout does not imply that the server stopped working. The CLI polls once per second for up to five minutes; if the operation is still pending, it exits with code `75` and prints the operation reference. Check it later with `gajaeway memory status <opRef>`. Completed autolink results include the commit SHA (or `null` when no commit was needed) and elapsed milliseconds.
+
+Audit prints JSON issues and exits non-zero when memory is not structurally sound. Its diagnostic codes are:
 
 - `map_dangling` — a `MEMORY.md` pointer does not exist.
 - `unmapped_axis_dir` — an axis has no heading in the map.

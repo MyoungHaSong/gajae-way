@@ -312,11 +312,20 @@ export class InboxGroup {
 	}
 
 	turnComplete(tx: WriteTx, opRef: string, unlinkedReason: TerminalUnlinkedReason = "no_delivery"): number {
-		return this.#db
+		const unlinked = JSON.stringify({ none: unlinkedReason });
+		const completed = this.#db
 			.prepare(
 				"UPDATE inbound_messages SET state = 'done', turn_state = 'done', terminal_delivery_id = COALESCE(terminal_delivery_id, ?) WHERE turn_op_ref = ? AND turn_role = 'trigger' AND state = 'pending' AND turn_state IN ('bound', 'accepted')",
 			)
-			.run(tx, JSON.stringify({ none: unlinkedReason }), opRef).changes;
+			.run(tx, unlinked, opRef).changes;
+		if (completed === 0) {
+			this.#db
+				.prepare(
+					"UPDATE inbound_messages SET terminal_delivery_id = ? WHERE turn_op_ref = ? AND turn_role = 'trigger' AND turn_state = 'done' AND terminal_delivery_id IS NULL",
+				)
+				.run(tx, unlinked, opRef);
+		}
+		return completed;
 	}
 
 	turnRequeue(tx: WriteTx, opRef: string): number {

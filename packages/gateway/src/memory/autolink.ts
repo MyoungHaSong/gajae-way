@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { MemoryClosureQueue } from "./closure";
-import { type CorpusWriter, corpusEntries, regenerateMap } from "./doctrine";
+import { corpusEntries, regenerateMap } from "./doctrine";
 import { loadRegistry } from "./registry";
 
 /**
@@ -33,6 +33,8 @@ export interface AutolinkReport {
 	readonly filesChanged: number;
 	readonly linksAdded: number;
 	readonly aliases: number;
+	readonly commitSha: string | null;
+	readonly elapsedMs: number;
 }
 
 const MIN_ALIAS_LENGTH = 3;
@@ -99,7 +101,7 @@ function normalizeAlias(alias: string): string {
 }
 
 export async function buildAliasIndex(
-	root: string,
+	_root: string,
 	files: readonly string[],
 	texts: ReadonlyMap<string, string>,
 ): Promise<AliasEntry[]> {
@@ -215,6 +217,7 @@ export function autolinkText(
 }
 
 export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue): Promise<AutolinkReport> {
+	const startedAt = performance.now();
 	const registry = await loadRegistry(root);
 	const raw = new Set(registry.byPriority.filter((axis) => axis.id === "daily").map((axis) => axis.root));
 	const files = (await corpusEntries(root)).filter(
@@ -250,26 +253,45 @@ export async function autolinkCorpus(root: string, closure?: MemoryClosureQueue)
 		if (position % 20 === 19) await Bun.sleep(0);
 	}
 
-	if (modifiedFiles.length === 0) return { filesChanged: 0, linksAdded: 0, aliases: index.length };
+	if (modifiedFiles.length === 0)
+		return {
+			filesChanged: 0,
+			linksAdded: 0,
+			aliases: index.length,
+			commitSha: null,
+			elapsedMs: Math.round(performance.now() - startedAt),
+		};
 	filesChanged = modifiedFiles.length;
 
 	// If no closure, just write locally (test mode, no commit)
 	if (!closure) {
 		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
 		await regenerateMap(root, registry);
-		return { filesChanged, linksAdded, aliases: index.length };
+		return {
+			filesChanged,
+			linksAdded,
+			aliases: index.length,
+			commitSha: null,
+			elapsedMs: Math.round(performance.now() - startedAt),
+		};
 	}
 
 	// With closure, run the full write, map regeneration, stage and commit transaction
 	// through the same FIFO as intents.
-	await closure.enqueueWork(async () => {
+	const commitSha = await closure.enqueueWork(async () => {
 		for (const { path, rewritten } of modifiedFiles) await writeFile(join(root, path), rewritten);
 		await regenerateMap(root, registry);
 		const writer = closure.getWriter(root);
 		for (const { path } of modifiedFiles) await writer.stageFiles(path);
 		await writer.stageFiles("MEMORY.md");
-		await writer.commit(`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`);
+		return writer.commit(`Memory autolink sweep: ${linksAdded} links in ${filesChanged} files`);
 	});
 
-	return { filesChanged, linksAdded, aliases: index.length };
+	return {
+		filesChanged,
+		linksAdded,
+		aliases: index.length,
+		commitSha: commitSha ?? null,
+		elapsedMs: Math.round(performance.now() - startedAt),
+	};
 }

@@ -16,6 +16,7 @@ import {
 	loadRegistry,
 	NAVIGATION_SOURCE_MAX_BYTES,
 } from "../src/memory/registry";
+import { getOrCreatePendingMemoryOp, pruneExpiredMemoryOps } from "../src/server/server";
 
 // A registry holding exactly one axis: createRegistry() would also seed every
 // built-in, and this test asserts the byte-for-byte rendering of a single axis.
@@ -285,4 +286,93 @@ test("issue #341: autolinkCorpus and closure intents serialize on the shared FIF
 		const c = await memoryGit(root, ["show", commit]);
 		expect(c).not.toContain(intentText);
 	}
+});
+
+test("issue #473: getOrCreatePendingMemoryOp deduplicates same-kind requests", async () => {
+	// Verify the actual getOrCreatePendingMemoryOp function returns created flag and
+	// returns the same opRef for concurrent requests of the same kind (autolink or audit).
+
+	interface MemoryOpStatus {
+		status: "pending" | "completed" | "failed";
+		result?: unknown;
+		error?: string;
+		startedAt: string;
+		expireAt: string;
+	}
+
+	const memoryOps = new Map<string, MemoryOpStatus>();
+
+	// First autolink request creates pending operation (created=true)
+	const { opRef: opRef1, created: created1 } = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(created1).toBe(true); // First request creates
+	expect(memoryOps.has(opRef1)).toBe(true);
+	expect(memoryOps.get(opRef1)?.status).toBe("pending");
+
+	// Second autolink request reuses the same opRef (created=false)
+	const { opRef: opRef2, created: created2 } = getOrCreatePendingMemoryOp(memoryOps, "autolink");
+	expect(created2).toBe(false); // Second request reuses
+	expect(opRef2).toBe(opRef1);
+	expect(memoryOps.size).toBe(1); // Still only one operation in map
+
+	// Audit request creates separate operation (not dedup'd with autolink)
+	const { opRef: auditOpRef, created: auditCreated } = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditCreated).toBe(true); // Audit creates new operation
+	expect(auditOpRef).not.toBe(opRef1); // Different opRef
+	expect(auditOpRef.startsWith("gw-ma-")).toBe(true); // Audit prefix
+	expect(opRef1.startsWith("gw-ml-")).toBe(true); // Autolink prefix
+	expect(memoryOps.size).toBe(2); // Two separate operations
+
+	// Second audit request reuses audit opRef (created=false)
+	const { opRef: auditOpRef2, created: auditCreated2 } = getOrCreatePendingMemoryOp(memoryOps, "audit");
+	expect(auditCreated2).toBe(false); // Second audit reuses
+	expect(auditOpRef2).toBe(auditOpRef);
+	expect(memoryOps.size).toBe(2); // Still two operations
+});
+
+test("issue #473: pruneExpiredMemoryOps removes settled operations past TTL", async () => {
+	// Expired settled operations are removed, but an operation still running past
+	// the TTL remains queryable until it settles.
+
+	interface MemoryOpStatus {
+		status: "pending" | "completed" | "failed";
+		result?: unknown;
+		error?: string;
+		startedAt: string;
+		expireAt: string;
+	}
+
+	const memoryOps = new Map<string, MemoryOpStatus>();
+	const baseTime = Date.now();
+
+	// Add expired operation (past its 24h TTL)
+	memoryOps.set("expired-op", {
+		status: "completed",
+		result: { filesChanged: 1 },
+		startedAt: new Date(baseTime - 48 * 60 * 60 * 1000).toISOString(),
+		expireAt: new Date(baseTime - 24 * 60 * 60 * 1000).toISOString(), // Expired
+	});
+
+	// Add recent operation (not expired)
+	memoryOps.set("recent-op", {
+		status: "completed",
+		result: { filesChanged: 2 },
+		startedAt: new Date(baseTime - 1 * 60 * 60 * 1000).toISOString(),
+		expireAt: new Date(baseTime + 23 * 60 * 60 * 1000).toISOString(), // Still valid
+	});
+	memoryOps.set("pending-op", {
+		status: "pending",
+		startedAt: new Date(baseTime - 48 * 60 * 60 * 1000).toISOString(),
+		expireAt: new Date(baseTime - 24 * 60 * 60 * 1000).toISOString(), // Expired, but still running
+	});
+
+	const sizeBefore = memoryOps.size;
+
+	// Run the actual pruning function
+	pruneExpiredMemoryOps(memoryOps, baseTime);
+
+	// The settled expired operation is removed; the recent and pending entries remain.
+	expect(memoryOps.size).toBe(sizeBefore - 1);
+	expect(memoryOps.has("expired-op")).toBe(false);
+	expect(memoryOps.has("recent-op")).toBe(true);
+	expect(memoryOps.has("pending-op")).toBe(true);
 });
