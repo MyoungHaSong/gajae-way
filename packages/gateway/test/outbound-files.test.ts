@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { GatewayConfig } from "../src/config";
 import { checkOutboundFile, deterministicFileDeliveryId } from "../src/server/outbound-files";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { Store } from "../src/store";
 import { attachTestBrokerOwnership, sessionPortFromResponder } from "./session-port.fake";
 
 const SLACK_ORIGIN = { platform: "slack", kind: "channel", conversationId: "C1" } as const;
@@ -48,7 +48,7 @@ async function settle(): Promise<void> {
 }
 
 /** Home with a workspace file and a secret; `reply` gets the home so it can name real paths. */
-async function gateway(reply: (home: string) => string): Promise<{ client: Client; database: GatewayDatabase }> {
+async function gateway(reply: (home: string) => string): Promise<{ client: Client; database: Store }> {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-files-"));
 	await mkdir(join(directory, "workspace"), { recursive: true });
 	await mkdir(join(directory, "secrets"), { recursive: true });
@@ -61,9 +61,10 @@ async function gateway(reply: (home: string) => string): Promise<{ client: Clien
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
+		gjc: { agentDir: join(directory, "broker", "agent") },
 		channels: { "slack:C1": { engagement: "open" }, "chan-1": { engagement: "open" } },
 	};
-	const database = await GatewayDatabase.open(config.dbPath);
+	const database = await Store.open(config.dbPath);
 	const answer = reply(directory);
 	const sessionPort = sessionPortFromResponder({
 		bind: async (originKey, epoch) => `session-${originKey}-${epoch}`,
@@ -118,7 +119,7 @@ test("a MEDIA: line becomes a file delivery in the reply's thread and leaves the
 	expect(file.payload.deliveryId).toBe(
 		deterministicFileDeliveryId("slack/channel/C1", SLACK_TRIGGER, join(directory, "workspace", "report.csv")),
 	);
-	expect(database.deliveryRows().some((row) => row.delivery_id === file.payload.deliveryId)).toBe(true);
+	expect(database.outbox.rows().some((row) => row.delivery_id === file.payload.deliveryId)).toBe(true);
 });
 
 test("a file-only reply uploads the file and speaks no empty message", async () => {

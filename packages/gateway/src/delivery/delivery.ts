@@ -161,12 +161,14 @@ export class DeliveryService {
 			file,
 		};
 		if (
-			!this.#ledger.createPending({
-				deliveryId,
-				turnId,
-				originKey: originKey(origin),
-				payloadJson: JSON.stringify(payload),
-			})
+			!this.#store.transaction((tx) =>
+				this.#store.outbox.create(tx, {
+					deliveryId,
+					turnId,
+					originKey: originKey(origin),
+					payloadJson: JSON.stringify(payload),
+				}),
+			)
 		)
 			return undefined;
 		return payload;
