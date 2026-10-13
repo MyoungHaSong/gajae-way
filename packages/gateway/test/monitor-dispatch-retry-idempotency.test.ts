@@ -6,6 +6,7 @@ import { CATCH_ALL_EVENT_ORIGIN, monitorSessionOrigin, originKey } from "@gajae-
 import { DeliveryService } from "../src/delivery/delivery";
 import { MonitorPropagator } from "../src/monitors/propagate";
 import { MonitorRegistry } from "../src/monitors/registry";
+import type { SessionRequestResult } from "../src/orchestrator/session-port";
 import { Store } from "../src/store";
 import { MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS } from "../src/store/groups/monitors";
 import { sessionPortFromScript } from "./session-port.fake";
@@ -27,7 +28,13 @@ afterEach(async () => {
 });
 
 async function fixture(
-	options: { eventType?: string; declaredEventTypes?: string[]; eventCount?: number; persistBinding?: boolean } = {},
+	options: {
+		eventType?: string;
+		declaredEventTypes?: string[];
+		eventCount?: number;
+		persistBinding?: boolean;
+		contextFailureRollThreshold?: number;
+	} = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retry-idempotency-"));
 	const store = await Store.open(join(home, "gateway.db"));
@@ -51,8 +58,9 @@ async function fixture(
 	if (!eventId) throw new Error("fixture requires at least one monitor event");
 	const pointerKey = `monitor_authoring_turn:${eventId}`;
 	const pointer = JSON.stringify({ sessionId: SESSION_ID, opRef: OP_REF, eventIds });
+	let bindSessionId = SESSION_ID;
 	const sessionPort = sessionPortFromScript({
-		bind: async () => ({ sessionId: SESSION_ID }),
+		bind: async () => ({ sessionId: bindSessionId }),
 		respond: async () => "[]",
 	});
 	store.transaction((tx) => {
@@ -79,9 +87,25 @@ async function fixture(
 		delivery: new DeliveryService(store),
 		emit: () => {},
 		repo: home,
+		...(options.contextFailureRollThreshold === undefined
+			? {}
+			: { contextFailureRollThreshold: options.contextFailureRollThreshold }),
 	});
 	propagator = pipeline;
-	return { eventId, eventIds, monitor, pipeline, pointer, pointerKey, sessionOriginKey, sessionPort, store };
+	return {
+		eventId,
+		eventIds,
+		monitor,
+		pipeline,
+		pointer,
+		pointerKey,
+		sessionOriginKey,
+		sessionPort,
+		setBindSessionId: (sessionId: string) => {
+			bindSessionId = sessionId;
+		},
+		store,
+	};
 }
 
 function countStatusCalls(port: ReturnType<typeof sessionPortFromScript>): () => number {
@@ -131,7 +155,36 @@ test("issue #187: an unreadable turn status is not treated as proof the turn sto
 });
 
 test("issue #187: a completed exhausted turn is resumed and its authored result is retained", async () => {
-	const state = await fixture({ eventCount: 2 });
+	const state = await fixture({
+		eventType: "test.undeclared",
+		declaredEventTypes: ["test.declared"],
+		eventCount: 2,
+		contextFailureRollThreshold: 1,
+	});
+	const originalRequest = state.sessionPort.request.bind(state.sessionPort);
+	state.sessionPort.request = async (input) =>
+		({
+			receipt: { sessionId: input.sessionId, operationRef: input.opRef } as never,
+			status: {
+				operationRef: input.opRef,
+				status: { status: "terminal_ok" },
+				summaryCompleted: true,
+			},
+			assistant: { text: "", pages: 1, complete: true },
+		}) satisfies SessionRequestResult;
+	const contextFailureId = await state.pipeline.submitAwaitable(state.monitor.monitorId, "test.undeclared", {});
+	state.sessionPort.request = originalRequest;
+	expect(state.pipeline.sessionSafetyState(state.sessionOriginKey).pendingRoll).toBe(
+		"context_failures_native_compaction_unavailable",
+	);
+	state.store.transaction((tx) => state.store.monitors.eventUpdate(tx, contextFailureId, "failed_no_retry"));
+	const rotatedSessionId = "test-session-187-rotated";
+	const rotatedEpoch = state.store.transaction((tx) => state.store.bindings.rotateEpoch(tx, state.sessionOriginKey));
+	state.store.transaction((tx) =>
+		state.store.bindings.bindAtEpoch(tx, state.sessionOriginKey, rotatedSessionId, rotatedEpoch),
+	);
+	state.setBindSessionId(rotatedSessionId);
+	const bindCountBeforeRecovery = state.sessionPort.binds.length;
 	const output = JSON.stringify(
 		state.eventIds.map((eventId, index) => ({ eventId, note: `completed result ${index + 1}` })),
 	);
@@ -153,6 +206,14 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 	]);
 	expect(state.sessionPort.sends.map((send) => send.opRef)).toEqual([OP_REF]);
 	expect(state.sessionPort.sendAttempts.map((send) => send.opRef)).toEqual([OP_REF, OP_REF]);
+	expect(state.sessionPort.binds).toHaveLength(bindCountBeforeRecovery);
+	expect(state.pipeline.sessionSafetyState(state.sessionOriginKey).pendingRoll).toBe(
+		"context_failures_native_compaction_unavailable",
+	);
+	expect(state.store.bindings.getSessionRecord(state.sessionOriginKey)).toEqual({
+		sessionId: rotatedSessionId,
+		epoch: rotatedEpoch,
+	});
 	expect(state.eventIds.map((eventId) => state.store.core.metaGet(`monitor_authoring_turn:${eventId}`))).toEqual([
 		undefined,
 		undefined,

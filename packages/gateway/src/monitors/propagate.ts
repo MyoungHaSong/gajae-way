@@ -125,7 +125,7 @@ interface AuthoringTurnPointer {
 type ExhaustedTurnDisposition =
 	| { readonly kind: "terminal" }
 	| { readonly kind: "hold" }
-	| { readonly kind: "resume"; readonly eventIds: readonly string[] };
+	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer };
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -585,8 +585,8 @@ export class MonitorPropagator {
 						const disposition = await this.#exhaustedTurnDisposition(row);
 						if (disposition.kind === "hold") continue;
 						if (disposition.kind === "resume") {
-							for (const eventId of disposition.eventIds) resumedAuthoringEvents.add(eventId);
-							await this.#dispatch([...disposition.eventIds], true);
+							for (const eventId of disposition.turn.eventIds) resumedAuthoringEvents.add(eventId);
+							await this.#dispatch([...disposition.turn.eventIds], disposition.turn);
 							continue;
 						}
 						const failedRow = this.#database.transaction((tx) => {
@@ -629,14 +629,8 @@ export class MonitorPropagator {
 		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold" };
 		const monitor = this.#registry.get(row.monitor_id);
 		if (!monitor) return { kind: "hold" };
-		let sessionOriginKey: string;
-		try {
-			sessionOriginKey = originKey(monitorOriginForEvent(monitor, row.event_type));
-		} catch {
-			return { kind: "hold" };
-		}
-		const sessionRecord = this.#database.bindings.getSessionRecord(sessionOriginKey);
-		if (sessionRecord && sessionRecord.sessionId !== turn.sessionId) return { kind: "hold" };
+		// The per-event pointer owns the original session/op-ref. Do not infer the
+		// session from row.event_type (including catch-all) or the current binding.
 		let report: Awaited<ReturnType<SessionPort["status"]>>;
 		try {
 			report = await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
@@ -646,7 +640,7 @@ export class MonitorPropagator {
 		}
 		const state = report.status?.status;
 		if (state === "failed") return { kind: "terminal" };
-		if (state !== "terminal_ok" || !sessionRecord) return { kind: "hold" };
+		if (state !== "terminal_ok") return { kind: "hold" };
 		for (const eventId of turn.eventIds) {
 			const related = this.#database.monitors.eventGet(eventId);
 			if (
@@ -659,7 +653,7 @@ export class MonitorPropagator {
 			)
 				return { kind: "hold" };
 		}
-		return { kind: "resume", eventIds: turn.eventIds };
+		return { kind: "resume", turn };
 	}
 
 	/**
@@ -677,11 +671,11 @@ export class MonitorPropagator {
 		if (row.stage === "batched") return !this.#inFlight.has(row.event_id);
 		return ["admitted", "dispatched", "failed"].includes(row.stage);
 	}
-	async #dispatch(eventIds: string[], requireAll = false): Promise<void> {
+	async #dispatch(eventIds: string[], resumeTurn?: AuthoringTurnPointer): Promise<void> {
 		for (const id of eventIds) this.#inFlight.add(id);
 		// Track the exact in-flight promise per event so awaitable submission can
 		// await the ORIGINAL chain (no second dispatch, no double authoring).
-		const promise = this.#dispatchBatch(eventIds, requireAll).finally(() => {
+		const promise = this.#dispatchBatch(eventIds, resumeTurn).finally(() => {
 			for (const id of eventIds) {
 				this.#inFlight.delete(id);
 				if (this.#inFlightPromises.get(id) === promise) this.#inFlightPromises.delete(id);
@@ -690,12 +684,40 @@ export class MonitorPropagator {
 		for (const id of eventIds) this.#inFlightPromises.set(id, promise);
 		await promise;
 	}
-	async #dispatchBatch(eventIds: string[], requireAll = false): Promise<void> {
+	async #dispatchBatch(eventIds: string[], resumeTurn?: AuthoringTurnPointer): Promise<void> {
+		if (
+			resumeTurn &&
+			(resumeTurn.eventIds.length !== eventIds.length || !resumeTurn.eventIds.every((id) => eventIds.includes(id)))
+		)
+			return;
+		const savedTurnMatches = () =>
+			!resumeTurn ||
+			resumeTurn.eventIds.every((eventId) => {
+				const raw = this.#database.core.metaGet(authoringTurnKey(eventId));
+				const saved = raw === undefined ? undefined : parseAuthoringTurnPointer(raw);
+				return saved !== undefined && sameAuthoringTurn(saved, resumeTurn);
+			});
+		const resumeRowsSafe = (candidateRows: readonly MonitorEventDbRow[]) => {
+			if (!resumeTurn) return true;
+			const first = candidateRows[0];
+			return (
+				candidateRows.length === eventIds.length &&
+				first !== undefined &&
+				candidateRows.every(
+					(row) =>
+						row.monitor_id === first.monitor_id &&
+						row.event_type === first.event_type &&
+						!(TERMINAL_STAGES as readonly string[]).includes(row.stage) &&
+						this.#database.monitors.authoredOutput(row.event_id) === undefined,
+				)
+			);
+		};
+		if (!savedTurnMatches()) return;
 		const rows = this.#database.monitors.eventsByIds(eventIds);
-		if (!rows.length || (requireAll && rows.length !== eventIds.length)) return;
+		if (!rows.length || !resumeRowsSafe(rows)) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
-			if (requireAll) return;
+			if (resumeTurn) return;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -730,7 +752,13 @@ export class MonitorPropagator {
 				leased.push(row);
 			}
 		}
-		if (!leased.length || (requireAll && leased.length !== rows.length)) {
+		if (!leased.length || (resumeTurn && leased.length !== rows.length)) {
+			for (const row of leased)
+				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
+			return;
+		}
+		const currentRows = this.#database.monitors.eventsByIds(eventIds);
+		if (resumeTurn && (!savedTurnMatches() || !resumeRowsSafe(currentRows))) {
 			for (const row of leased)
 				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
 			return;
@@ -740,7 +768,7 @@ export class MonitorPropagator {
 		for (const row of leased) {
 			if (this.#fencedUpdate(row.event_id, leaseId, batchId, now())) claimed.push(row);
 		}
-		if (!claimed.length || (requireAll && claimed.length !== leased.length)) {
+		if (!claimed.length || (resumeTurn && claimed.length !== leased.length)) {
 			// Ownership changed during the claim: release every acquired lease and
 			// let a later sweep reclaim any rows already moved to `batched`.
 			for (const row of leased)
@@ -822,55 +850,62 @@ export class MonitorPropagator {
 			let protocolResponseEntryCount: number | null = null;
 			let protocolValidationActive = false;
 			try {
-				// Safety-net roll boundary (issue #68). It sits HERE, after the
-				// per-origin turn chain has been acquired and before this batch's
-				// session is bound: the previous batch's authoring turn has already
-				// settled, and this batch's events are claimed under live leases but
-				// not yet authored. A roll can therefore neither strand an in-flight
-				// batch nor let one be authored twice — the events simply land in the
-				// new epoch's session. Leases and fencing are untouched.
-				const digest = this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
-				const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+				// A completed saved turn must be harvested before a pending roll changes
+				// its session ID. Fresh dispatches still roll at this boundary (#68).
+				const digest = resumeTurn
+					? undefined
+					: this.#rollSessionIfArmed(sessionOriginKey, JSON.stringify(sessionOrigin), monitor);
 				const effectiveModel = (monitor.model as GjcModelSelection | undefined) ?? this.#model;
 				const effectiveServiceTier = (monitor.serviceTier as GjcServiceTier | undefined) ?? this.#serviceTier;
-				dispatchOperation = "bind";
-				dispatchOperationArgs = {
-					epoch: boundEpoch,
-					hasModel: effectiveModel !== undefined,
-				};
-				const binding = await this.#sessionPort.bind({
-					originKey: sessionOriginKey,
-					epoch: boundEpoch,
-					repo: this.#repo,
-					...(effectiveModel ? { model: effectiveModel } : {}),
-				});
-				const { sessionId } = binding;
+				let sessionId: string;
+				if (resumeTurn) {
+					sessionId = resumeTurn.sessionId;
+					const current = this.#database.bindings.getSessionRecord(sessionOriginKey);
+					boundSessionEpoch = current?.sessionId === sessionId ? current.epoch : undefined;
+					dispatchOperation = "request";
+					dispatchOperationArgs = { opRef: resumeTurn.opRef };
+					dispatchPhase = "procedure";
+				} else {
+					const boundEpoch = this.#database.bindings.getSessionRecord(sessionOriginKey)?.epoch ?? 0;
+					dispatchOperation = "bind";
+					dispatchOperationArgs = {
+						epoch: boundEpoch,
+						hasModel: effectiveModel !== undefined,
+					};
+					const binding = await this.#sessionPort.bind({
+						originKey: sessionOriginKey,
+						epoch: boundEpoch,
+						repo: this.#repo,
+						...(effectiveModel ? { model: effectiveModel } : {}),
+					});
+					sessionId = binding.sessionId;
+					boundSessionEpoch = binding.epoch;
+					dispatchPhase = "configure";
+					const modelKey = effectiveModel
+						? typeof effectiveModel === "string"
+							? effectiveModel
+							: `preset:${effectiveModel.preset}`
+						: undefined;
+					if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
+						dispatchOperation = "setModel";
+						dispatchOperationArgs = {
+							model: modelKey,
+						};
+						await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
+						this.#appliedModels.set(sessionId, modelKey!);
+					} else if (effectiveModel && binding.startupModelApplied) {
+						this.#appliedModels.set(sessionId, modelKey!);
+					}
+					if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
+						dispatchOperation = "setServiceTier";
+						dispatchOperationArgs = {
+							tier: effectiveServiceTier,
+						};
+						await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
+						this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
+					}
+				}
 				boundSessionId = sessionId;
-				boundSessionEpoch = binding.epoch;
-				dispatchPhase = "configure";
-				const modelKey = effectiveModel
-					? typeof effectiveModel === "string"
-						? effectiveModel
-						: `preset:${effectiveModel.preset}`
-					: undefined;
-				if (effectiveModel && !binding.startupModelApplied && this.#appliedModels.get(sessionId) !== modelKey) {
-					dispatchOperation = "setModel";
-					dispatchOperationArgs = {
-						model: modelKey,
-					};
-					await this.#sessionPort.setModel({ sessionId, repo: this.#repo, selection: effectiveModel });
-					this.#appliedModels.set(sessionId, modelKey!);
-				} else if (effectiveModel && binding.startupModelApplied) {
-					this.#appliedModels.set(sessionId, modelKey!);
-				}
-				if (effectiveServiceTier && this.#appliedServiceTiers.get(sessionId) !== effectiveServiceTier) {
-					dispatchOperation = "setServiceTier";
-					dispatchOperationArgs = {
-						tier: effectiveServiceTier,
-					};
-					await this.#sessionPort.setServiceTier({ sessionId, repo: this.#repo, tier: effectiveServiceTier });
-					this.#appliedServiceTiers.set(sessionId, effectiveServiceTier);
-				}
 				// Guidance order: the monitor's own instruction first (it is what the
 				// owner actually asked this monitor to do), then any built-in
 				// maintenance semantics for the claimed event types. Without either,
@@ -894,12 +929,12 @@ export class MonitorPropagator {
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${procedure.prompt ? `\n${procedure.prompt}\n` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				// #187: a request-phase failure does not mean the prompt was refused —
 				// the turn it started may still be running. Reuse its op-ref on retry.
+				const authoringEventIds = resumeTurn?.eventIds ?? claimed.map((row) => row.event_id);
 				const opRef =
-					(await this.#reusableAuthoringTurn(
-						claimed.map((row) => row.event_id),
-						sessionId,
-					)) ?? `gw-m-${batchId.replaceAll("-", "")}`;
-				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: claimed.map((row) => row.event_id) });
+					resumeTurn?.opRef ??
+					(await this.#reusableAuthoringTurn(authoringEventIds, sessionId)) ??
+					`gw-m-${batchId.replaceAll("-", "")}`;
+				const pendingTurn = JSON.stringify({ sessionId, opRef, eventIds: authoringEventIds });
 				this.#database.transaction(() => {
 					for (const row of claimed) this.#database.core.metaSet(authoringTurnKey(row.event_id), pendingTurn);
 				});
@@ -928,17 +963,22 @@ export class MonitorPropagator {
 				// validated. The count is OBSERVATIONAL: it is reported, and it never
 				// rolls a session on its own — native gjc compaction owns keeping the
 				// context bounded while the session is answering.
-				const turns = this.#database.transaction((tx) =>
-					this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
-				);
-				this.#safetyState(sessionOriginKey).turns = turns;
+				if (boundSessionEpoch !== undefined) {
+					const turns = this.#database.transaction((tx) =>
+						this.#database.bindings.incrementTurnCount(tx, sessionOriginKey, JSON.stringify(sessionOrigin)),
+					);
+					this.#safetyState(sessionOriginKey).turns = turns;
+				}
 				// A non-empty answer is proof the session still has usable context, so
 				// it clears the context-failure streak. A malformed answer is still an
 				// answer: it must not arm the safety net.
-				if (response.trim()) this.#safetyState(sessionOriginKey).contextFailures = 0;
-				else throw new Error("authoring response is empty");
-				// The runtime accepted and finished a turn, so it is not stalled.
-				this.#safetyState(sessionOriginKey).busyFailures = 0;
+				if (!response.trim()) throw new Error("authoring response is empty");
+				if (boundSessionEpoch !== undefined) {
+					const safety = this.#safetyState(sessionOriginKey);
+					safety.contextFailures = 0;
+					// The runtime accepted and finished a turn, so it is not stalled.
+					safety.busyFailures = 0;
+				}
 				// Lease fencing: after an await, this attempt may no longer own the
 				// claim (expired + stolen). Every write below is conditional on the
 				// live lease; a stale attempt's completion becomes a no-op.
@@ -1595,6 +1635,15 @@ function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefine
 	)
 		return undefined;
 	return { sessionId: record.sessionId, opRef: record.opRef, eventIds };
+}
+
+function sameAuthoringTurn(left: AuthoringTurnPointer, right: AuthoringTurnPointer): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		left.opRef === right.opRef &&
+		left.eventIds.length === right.eventIds.length &&
+		left.eventIds.every((eventId) => right.eventIds.includes(eventId))
+	);
 }
 
 function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): OriginRef {
