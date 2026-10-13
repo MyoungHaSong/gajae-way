@@ -19,6 +19,7 @@ import type { Store } from "../store";
 import {
 	MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS,
 	MONITOR_EVENT_RETRY_BACKOFF_MS,
+	type MonitorEventDbRow,
 	RECONCILABLE_STAGES,
 	TERMINAL_STAGES,
 } from "../store/groups/monitors";
@@ -114,6 +115,17 @@ interface LiveClaim {
 	readonly phase: () => string;
 	readonly sessionId: () => string | undefined;
 }
+
+interface AuthoringTurnPointer {
+	readonly sessionId: string;
+	readonly opRef: string;
+	readonly eventIds: readonly string[];
+}
+
+type ExhaustedTurnDisposition =
+	| { readonly kind: "terminal" }
+	| { readonly kind: "hold" }
+	| { readonly kind: "resume"; readonly eventIds: readonly string[] };
 
 export interface MonitorDispatchFailure {
 	readonly eventId: string;
@@ -543,7 +555,11 @@ export class MonitorPropagator {
 				});
 			}
 			// Replay oldest-first: recovery must re-author events in the order they fired.
-			for (const row of this.#database.monitors.eventsOpen()) {
+			const resumedAuthoringEvents = new Set<string>();
+			for (const candidate of this.#database.monitors.eventsOpen()) {
+				if (resumedAuthoringEvents.has(candidate.event_id)) continue;
+				const row = this.#database.monitors.eventGet(candidate.event_id);
+				if (!row) continue;
 				// A closing propagator starts no new dispatch: the rows stay recoverable
 				// for the next boot's sweep instead of being claimed by a dying process.
 				if (this.#closing) break;
@@ -565,12 +581,28 @@ export class MonitorPropagator {
 					// are reclaimed here (the dispatcher acquires its own lease).
 					if (this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())) continue;
 					if (row.dispatch_attempts >= MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS) {
+						// Exhausting dispatch attempts does not settle the turn they may have started.
+						const disposition = await this.#exhaustedTurnDisposition(row);
+						if (disposition.kind === "hold") continue;
+						if (disposition.kind === "resume") {
+							for (const eventId of disposition.eventIds) resumedAuthoringEvents.add(eventId);
+							await this.#dispatch([...disposition.eventIds], true);
+							continue;
+						}
 						const failedRow = this.#database.transaction((tx) => {
-							const current = this.#database.monitors.eventGet(row.event_id, true);
-							if (!current) return undefined;
+							const current = this.#database.monitors.eventGet(row.event_id);
+							if (
+								!current ||
+								current.dispatch_attempts !== row.dispatch_attempts ||
+								current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
+								(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
+								this.#database.monitors.authoredOutput(row.event_id) !== undefined ||
+								this.#database.monitors.eventLiveLeaseOwner(row.event_id, this.#now())
+							)
+								return undefined;
 							this.#database.monitors.eventUpdate(tx, row.event_id, "failed_no_retry", null);
 							this.#database.core.metaDelete(authoringTurnKey(row.event_id));
-							return current.stage === "failed_no_retry" ? undefined : current;
+							return current;
 						});
 						if (failedRow) this.#emitStage(failedRow, "failed_no_retry");
 						continue;
@@ -589,6 +621,46 @@ export class MonitorPropagator {
 			this.#reconciling = false;
 		}
 	}
+	/** Only an explicitly failed operation can be discarded; completed output is resumed under its original op-ref. */
+	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
+		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
+		if (raw === undefined) return { kind: "terminal" };
+		const turn = parseAuthoringTurnPointer(raw);
+		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold" };
+		const monitor = this.#registry.get(row.monitor_id);
+		if (!monitor) return { kind: "hold" };
+		let sessionOriginKey: string;
+		try {
+			sessionOriginKey = originKey(monitorOriginForEvent(monitor, row.event_type));
+		} catch {
+			return { kind: "hold" };
+		}
+		const sessionRecord = this.#database.bindings.getSessionRecord(sessionOriginKey);
+		if (!sessionRecord || sessionRecord.sessionId !== turn.sessionId) return { kind: "hold" };
+		let report: Awaited<ReturnType<SessionPort["status"]>>;
+		try {
+			report = await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
+		} catch {
+			// An unreadable status is not proof that the turn stopped running.
+			return { kind: "hold" };
+		}
+		const state = report.status?.status;
+		if (state === "failed") return { kind: "terminal" };
+		if (state !== "terminal_ok") return { kind: "hold" };
+		for (const eventId of turn.eventIds) {
+			const related = this.#database.monitors.eventGet(eventId);
+			if (
+				!related ||
+				related.monitor_id !== row.monitor_id ||
+				related.event_type !== row.event_type ||
+				(TERMINAL_STAGES as readonly string[]).includes(related.stage) ||
+				this.#database.core.metaGet(authoringTurnKey(eventId)) !== raw ||
+				this.#database.monitors.eventLiveLeaseOwner(eventId, this.#now())
+			)
+				return { kind: "hold" };
+		}
+		return { kind: "resume", eventIds: turn.eventIds };
+	}
 
 	/**
 	 * `batched` is a live stage: a dispatch that is still awaiting its authoring turn sits there
@@ -605,11 +677,11 @@ export class MonitorPropagator {
 		if (row.stage === "batched") return !this.#inFlight.has(row.event_id);
 		return ["admitted", "dispatched", "failed"].includes(row.stage);
 	}
-	async #dispatch(eventIds: string[]): Promise<void> {
+	async #dispatch(eventIds: string[], requireAll = false): Promise<void> {
 		for (const id of eventIds) this.#inFlight.add(id);
 		// Track the exact in-flight promise per event so awaitable submission can
 		// await the ORIGINAL chain (no second dispatch, no double authoring).
-		const promise = this.#dispatchBatch(eventIds).finally(() => {
+		const promise = this.#dispatchBatch(eventIds, requireAll).finally(() => {
 			for (const id of eventIds) {
 				this.#inFlight.delete(id);
 				if (this.#inFlightPromises.get(id) === promise) this.#inFlightPromises.delete(id);
@@ -618,11 +690,12 @@ export class MonitorPropagator {
 		for (const id of eventIds) this.#inFlightPromises.set(id, promise);
 		await promise;
 	}
-	async #dispatchBatch(eventIds: string[]): Promise<void> {
+	async #dispatchBatch(eventIds: string[], requireAll = false): Promise<void> {
 		const rows = this.#database.monitors.eventsByIds(eventIds);
-		if (!rows.length) return;
+		if (!rows.length || (requireAll && rows.length !== eventIds.length)) return;
 		const monitor = this.#registry.get(rows[0]?.monitor_id);
 		if (!monitor) {
+			if (requireAll) return;
 			for (const row of rows) {
 				const failed = this.#database.transaction((tx) =>
 					this.#database.monitors.eventTerminalFail(
@@ -657,21 +730,24 @@ export class MonitorPropagator {
 				leased.push(row);
 			}
 		}
-		if (!leased.length) return;
+		if (!leased.length || (requireAll && leased.length !== rows.length)) {
+			for (const row of leased)
+				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
+			return;
+		}
 		// Fence the initial stage claim: only rows we still own transition.
 		const claimed: typeof leased = [];
 		for (const row of leased) {
 			if (this.#fencedUpdate(row.event_id, leaseId, batchId, now())) claimed.push(row);
 		}
-		if (!claimed.length) {
-			// Ownership stolen between claim and batching: release every acquired
-			// lease and bail — no heartbeat, no dispatch, no writes.
+		if (!claimed.length || (requireAll && claimed.length !== leased.length)) {
+			// Ownership changed during the claim: release every acquired lease and
+			// let a later sweep reclaim any rows already moved to `batched`.
 			for (const row of leased)
 				this.#database.transaction((tx) => this.#database.monitors.eventReleaseLease(tx, row.event_id, leaseId));
 			return;
 		}
 		for (const row of claimed) this.#emitStage(row, "batched");
-		const declared = new Set(monitor.eventTypes);
 		const claimedEventType = claimed[0]?.event_type;
 		let sessionOrigin: OriginRef;
 		let sessionOriginKey: string;
@@ -680,10 +756,7 @@ export class MonitorPropagator {
 			originKey(eventTypeOrigin(claimedEventType));
 			// The session is owned by THIS monitor (#177): monitors that declare the
 			// same event type must not share history, instruction, or failure domain.
-			sessionOrigin = monitorSessionOrigin(
-				monitor.monitorId,
-				declared.has(claimedEventType) ? claimedEventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
-			);
+			sessionOrigin = monitorOriginForEvent(monitor, claimedEventType);
 			sessionOriginKey = originKey(sessionOrigin);
 		} catch {
 			this.#database.transaction((tx) => {
@@ -1498,6 +1571,37 @@ export function parseAuthoredArray(response: string): unknown {
 /** Durable pointer from an event to the authoring turn its last dispatch started (#187). */
 function authoringTurnKey(eventId: string): string {
 	return `monitor_authoring_turn:${eventId}`;
+}
+
+function parseAuthoringTurnPointer(raw: string): AuthoringTurnPointer | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	const eventIds = record.eventIds;
+	if (
+		typeof record.sessionId !== "string" ||
+		!record.sessionId ||
+		typeof record.opRef !== "string" ||
+		!record.opRef ||
+		!Array.isArray(eventIds) ||
+		eventIds.length === 0 ||
+		!eventIds.every((eventId): eventId is string => typeof eventId === "string" && eventId.length > 0) ||
+		new Set(eventIds).size !== eventIds.length
+	)
+		return undefined;
+	return { sessionId: record.sessionId, opRef: record.opRef, eventIds };
+}
+
+function monitorOriginForEvent(monitor: MonitorRecord, eventType: string): OriginRef {
+	return monitorSessionOrigin(
+		monitor.monitorId,
+		monitor.eventTypes.includes(eventType) ? eventType : CATCH_ALL_EVENT_ORIGIN.conversationId,
+	);
 }
 
 /** Only explicit diagnostic vocabulary crosses the durable boundary, never raw error text. */
