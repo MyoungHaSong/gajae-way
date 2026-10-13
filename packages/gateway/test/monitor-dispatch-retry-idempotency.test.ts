@@ -26,7 +26,9 @@ afterEach(async () => {
 	home = "";
 });
 
-async function fixture(options: { eventType?: string; declaredEventTypes?: string[]; eventCount?: number } = {}) {
+async function fixture(
+	options: { eventType?: string; declaredEventTypes?: string[]; eventCount?: number; persistBinding?: boolean } = {},
+) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-monitor-retry-idempotency-"));
 	const store = await Store.open(join(home, "gateway.db"));
 	database = store;
@@ -54,7 +56,7 @@ async function fixture(options: { eventType?: string; declaredEventTypes?: strin
 		respond: async () => "[]",
 	});
 	store.transaction((tx) => {
-		store.bindings.bindAtEpoch(tx, sessionOriginKey, SESSION_ID, 0);
+		if (options.persistBinding !== false) store.bindings.bindAtEpoch(tx, sessionOriginKey, SESSION_ID, 0);
 		for (const currentId of eventIds) {
 			store.monitors.eventCreate(tx, {
 				eventId: currentId,
@@ -158,7 +160,7 @@ test("issue #187: a completed exhausted turn is resumed and its authored result 
 });
 
 test("an exhausted event is terminalized when its recorded authoring turn failed", async () => {
-	const state = await fixture();
+	const state = await fixture({ persistBinding: false });
 	state.sessionPort.seedOperation(OP_REF, SESSION_ID, "failed");
 
 	await state.pipeline.reconcile();

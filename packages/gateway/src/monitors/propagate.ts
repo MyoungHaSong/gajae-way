@@ -636,7 +636,7 @@ export class MonitorPropagator {
 			return { kind: "hold" };
 		}
 		const sessionRecord = this.#database.bindings.getSessionRecord(sessionOriginKey);
-		if (!sessionRecord || sessionRecord.sessionId !== turn.sessionId) return { kind: "hold" };
+		if (sessionRecord && sessionRecord.sessionId !== turn.sessionId) return { kind: "hold" };
 		let report: Awaited<ReturnType<SessionPort["status"]>>;
 		try {
 			report = await this.#sessionPort.status({ sessionId: turn.sessionId, repo: this.#repo, opRef: turn.opRef });
@@ -646,7 +646,7 @@ export class MonitorPropagator {
 		}
 		const state = report.status?.status;
 		if (state === "failed") return { kind: "terminal" };
-		if (state !== "terminal_ok") return { kind: "hold" };
+		if (state !== "terminal_ok" || !sessionRecord) return { kind: "hold" };
 		for (const eventId of turn.eventIds) {
 			const related = this.#database.monitors.eventGet(eventId);
 			if (
