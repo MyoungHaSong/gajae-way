@@ -123,7 +123,7 @@ interface AuthoringTurnPointer {
 }
 
 type ExhaustedTurnDisposition =
-	| { readonly kind: "terminal" }
+	| { readonly kind: "terminal"; readonly raw: string | undefined }
 	| { readonly kind: "hold" }
 	| { readonly kind: "resume"; readonly turn: AuthoringTurnPointer };
 
@@ -593,6 +593,7 @@ export class MonitorPropagator {
 							const current = this.#database.monitors.eventGet(row.event_id);
 							if (
 								!current ||
+								this.#database.core.metaGet(authoringTurnKey(row.event_id)) !== disposition.raw ||
 								current.dispatch_attempts !== row.dispatch_attempts ||
 								current.dispatch_attempts < MONITOR_EVENT_MAX_DISPATCH_ATTEMPTS ||
 								(TERMINAL_STAGES as readonly string[]).includes(current.stage) ||
@@ -624,7 +625,7 @@ export class MonitorPropagator {
 	/** Only an explicitly failed operation can be discarded; completed output is resumed under its original op-ref. */
 	async #exhaustedTurnDisposition(row: MonitorEventDbRow): Promise<ExhaustedTurnDisposition> {
 		const raw = this.#database.core.metaGet(authoringTurnKey(row.event_id));
-		if (raw === undefined) return { kind: "terminal" };
+		if (raw === undefined) return { kind: "terminal", raw };
 		const turn = parseAuthoringTurnPointer(raw);
 		if (!turn?.eventIds.includes(row.event_id)) return { kind: "hold" };
 		const monitor = this.#registry.get(row.monitor_id);
@@ -639,7 +640,7 @@ export class MonitorPropagator {
 			return { kind: "hold" };
 		}
 		const state = report.status?.status;
-		if (state === "failed") return { kind: "terminal" };
+		if (state === "failed") return { kind: "terminal", raw };
 		if (state !== "terminal_ok") return { kind: "hold" };
 		for (const eventId of turn.eventIds) {
 			const related = this.#database.monitors.eventGet(eventId);
