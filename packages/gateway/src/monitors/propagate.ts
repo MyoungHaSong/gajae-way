@@ -879,6 +879,7 @@ export class MonitorPropagator {
 						...(effectiveModel ? { model: effectiveModel } : {}),
 					});
 					sessionId = binding.sessionId;
+					boundSessionId = sessionId;
 					boundSessionEpoch = binding.epoch;
 					dispatchPhase = "configure";
 					const modelKey = effectiveModel
