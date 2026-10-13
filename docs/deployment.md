@@ -60,6 +60,8 @@ dist/gajaeway-admin
 dist/gajaeway
 ```
 
+On macOS, `bun run build` finishes with `scripts/sign-dist.sh`, which re-signs every binary with a local code-signing identity if one is configured (identifiers: `dev.gajaeway.<gateway|slack|discord|telegram|admin|cli>`). Without macOS code signing, TCC grants (Documents, Desktop, Downloads, Full Disk Access) are pinned to one build's hash, so every rebuild re-prompts; with a stable identity a grant persists. The script reads the signing identity from `GAJAEWAY_CODESIGN_IDENTITY` or `~/.gajaeway/codesign-identity` (first line); if neither is set, ad-hoc signatures remain in place. On non-macOS hosts the script exits early, making it a safe no-op.
+
 Each adapter binary runs in the foreground. Discord and Slack `--help` and `--version` return without connecting. Every adapter acquires its own non-blocking home lease (`adapter-discord`, `adapter-slack`, or `adapter-telegram`) and refuses a second owner for the same `$GAJAEWAY_HOME`; no PID file decides ownership.
 
 The release gateway does not use an arbitrary executable found on `PATH`. It reads the exact GJC version from the gateway package pin; the current pin is `0.18.11`. When installing a release or running `gajaeway update --force`, the updater installs that version under `$GAJAEWAY_HOME/gjc/<version>/bin/gjc`, verifies its reported version, and atomically flips `$GAJAEWAY_HOME/gjc/current` to it. The previous version is retained for rollback. The binaries need no source checkout or Bun to run; installing/updating the pinned GJC package uses Bun on the update host.

@@ -159,13 +159,14 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-1";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -176,7 +177,8 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 				messageId: "m-1",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}
+`,
 	);
 
 	// Wait for the turn to be sent to the session port
@@ -260,13 +262,14 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-2";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -277,7 +280,8 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 				messageId: "m-2",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}
+`,
 	);
 
 	// Wait for the turn to be sent to the session port
@@ -365,13 +369,14 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } }) + "\n");
+	socket.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}
+`);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
 	const requestId = "req-3";
 	socket.write(
-		JSON.stringify({
+		`${JSON.stringify({
 			v: "0.1",
 			type: "request",
 			id: requestId,
@@ -382,7 +387,8 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 				messageId: "m-3",
 				engagement: { mentioned: true, group: true, authorId: "user-1" },
 			},
-		}) + "\n",
+		})}
+`,
 	);
 
 	// Wait for the turn to be sent to the session port
