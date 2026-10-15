@@ -105,3 +105,17 @@ test("Slack liveReplies must be a boolean and passes through when set", async ()
 		expect(config.liveReplies).toBe(true);
 	});
 });
+
+test("Slack socketLivenessTimeoutMs must be an integer of at least 30s and passes through when set", async () => {
+	await fixture(async (home, save) => {
+		for (const invalid of ["900000", 1.5, 29_999]) {
+			await save({ ...valid, socketLivenessTimeoutMs: invalid });
+			await expect(loadSlackAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toThrow("socketLivenessTimeoutMs");
+		}
+		await save({ ...valid, socketLivenessTimeoutMs: 120_000 });
+		const config = await loadSlackAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(config.socketLivenessTimeoutMs).toBe(120_000);
+		await save(valid);
+		expect((await loadSlackAdapterConfig({ GAJAEWAY_HOME: home })).socketLivenessTimeoutMs).toBeUndefined();
+	});
+});

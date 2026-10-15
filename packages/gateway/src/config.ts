@@ -1,6 +1,7 @@
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homeLayout } from "@gajae-gateway/home";
 import {
 	type ChannelEngagementPolicy,
 	describeChatPlatforms,
@@ -36,6 +37,24 @@ export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
+}
+
+/**
+ * Upper bound on concurrently live persona session hosts (one
+ * `gjc sdk session-host-internal` process, ~360 MB, per bound origin). Past
+ * it, the least-recently-active idle host is retired before a new origin binds;
+ * when every host is busy the new turn is held, not spawned (live, 2026-10: 81
+ * open channels spawned 16 hosts, exhausted an 8 GB VM, and the broker answered
+ * `broker_unavailable` to everything).
+ */
+export const DEFAULT_SESSIONS_MAX_LIVE_HOSTS = 8;
+/** A persona host idle for this long is ended by the sweep; its session resumes with history on the next turn. */
+export const DEFAULT_SESSIONS_IDLE_RETIRE_MS = 6 * 60 * 60_000;
+const SESSIONS_MAX_LIVE_HOSTS_MAX = 256;
+
+export interface SessionHostConfig {
+	readonly maxLiveHosts?: number;
+	readonly idleRetireMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -98,13 +117,15 @@ export interface GatewayConfigFile {
 	readonly runtime?: RuntimeConfig;
 	/** Worker-lane governance: admission cap and idle retirement for `work.run` sessions. */
 	readonly work?: WorkLaneConfig;
+	/** Persona-host governance: live-host cap and idle retirement for conversation sessions. */
+	readonly sessions?: SessionHostConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
 	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
 	readonly interimSpeech?: InterimSpeechConfig;
 	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
 	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
-	/** Absolute path to gjc agent directory; overrides GJC_CODING_AGENT_DIR. Defaults to $GAJAEWAY_HOME/gjc-agent for fresh homes; existing homes keep their established directory. */
+	/** Optional absolute path override for the broker agent directory. */
 	readonly gjc?: { readonly agentDir?: string } | undefined;
 }
 
@@ -145,6 +166,7 @@ export interface BotAudienceConfig {
 }
 
 export interface GatewayConfig extends GatewayConfigFile {
+	readonly gjc: { readonly agentDir: string };
 	readonly home: string;
 	readonly configPath: string;
 	readonly socketPath: string;
@@ -517,6 +539,36 @@ function parseWork(value: unknown): WorkLaneConfig {
 	};
 }
 
+function parseSessions(value: unknown): SessionHostConfig {
+	const input = requireObject(value, "sessions");
+	if (Object.keys(input).some((key) => key !== "maxLiveHosts" && key !== "idleRetireMs"))
+		throw new ConfigError("config_invalid", "sessions may only contain maxLiveHosts and idleRetireMs");
+	if (
+		input.maxLiveHosts !== undefined &&
+		(!Number.isInteger(input.maxLiveHosts) ||
+			(input.maxLiveHosts as number) < 1 ||
+			(input.maxLiveHosts as number) > SESSIONS_MAX_LIVE_HOSTS_MAX)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.maxLiveHosts must be an integer between 1 and ${SESSIONS_MAX_LIVE_HOSTS_MAX}`,
+		);
+	if (
+		input.idleRetireMs !== undefined &&
+		(!Number.isInteger(input.idleRetireMs) ||
+			(input.idleRetireMs as number) < WORK_IDLE_RETIRE_MIN_MS ||
+			(input.idleRetireMs as number) > WORK_IDLE_RETIRE_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
+		);
+	return {
+		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
+		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+	};
+}
+
 function parseDmPolicy(value: unknown): DmPolicy {
 	if (typeof value !== "string" || !DM_POLICIES.includes(value as DmPolicy))
 		throw new ConfigError("config_invalid", `dmPolicy must be one of ${DM_POLICIES.join(", ")}`);
@@ -583,6 +635,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
+		...(input.sessions === undefined ? {} : { sessions: parseSessions(input.sessions) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
 		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
@@ -614,7 +667,7 @@ export async function loadConfig(
 		readonly requireFile?: boolean;
 	} = {},
 ): Promise<GatewayConfig> {
-	const home = options.home ?? gatewayHome(options.env);
+	const home = resolve(options.home ?? gatewayHome(options.env));
 	const configPath = join(home, "config.json");
 	let fileConfig: GatewayConfigFile = { schemaVersion: CONFIG_SCHEMA_VERSION };
 	let raw: string | undefined;
@@ -652,6 +705,7 @@ export async function loadConfig(
 	const overrides = options.overrides ?? {};
 	return {
 		...fileConfig,
+		gjc: { ...fileConfig.gjc, agentDir: fileConfig.gjc?.agentDir ?? homeLayout(home).brokerAgentDir },
 		home,
 		configPath,
 		socketPath: overrides.socketPath ?? fileConfig.socketPath ?? join(home, "gateway.sock"),
@@ -692,8 +746,9 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 /**
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
  * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
- * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
- * applies to the next actor event.
+ * resolved per inbound message), `stallTimeoutMs` (tail liveness alarms) and
+ * `sessions` (persona host cap and idle retirement, applied to the next bind and
+ * sweep). Each applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
@@ -702,6 +757,7 @@ export const RELOADABLE_FIELDS = [
 	"dmPolicy",
 	"botAudience",
 	"handoffTargets",
+	"sessions",
 ] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */

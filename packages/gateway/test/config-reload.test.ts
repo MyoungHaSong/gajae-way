@@ -219,3 +219,33 @@ test("interim speech config parses non-negative integers and requires restart", 
 		"interimSpeech contains an unknown field",
 	);
 });
+
+test("sessions host limits parse, omit absent fields, and reload live", async () => {
+	const sessions = { maxLiveHosts: 4, idleRetireMs: 3_600_000 };
+	expect(parseConfigFile({ schemaVersion: 1, sessions }).sessions).toEqual(sessions);
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { maxLiveHosts: 1 } }).sessions).toEqual({ maxLiveHosts: 1 });
+	expect(parseConfigFile({ schemaVersion: 1 })).not.toHaveProperty("sessions");
+	const path = await home();
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 8 } }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, sessions: { maxLiveHosts: 2 } }));
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: ["sessions"], restartRequired: [] });
+	if (result.ok) expect(result.config.sessions).toEqual({ maxLiveHosts: 2 });
+});
+
+for (const [sessions, field] of [
+	[{ maxLiveHosts: 0 }, "sessions.maxLiveHosts"],
+	[{ maxLiveHosts: 257 }, "sessions.maxLiveHosts"],
+	[{ maxLiveHosts: 2.5 }, "sessions.maxLiveHosts"],
+	[{ maxLiveHosts: "8" }, "sessions.maxLiveHosts"],
+	[{ idleRetireMs: 1_000 }, "sessions.idleRetireMs"],
+	[{ idleRetireMs: 8 * 24 * 60 * 60_000 }, "sessions.idleRetireMs"],
+	[{ maxHosts: 1 }, "sessions"],
+] as const) {
+	test(`rejects invalid sessions configuration ${JSON.stringify(sessions)}`, () => {
+		const parse = () => parseConfigFile({ schemaVersion: 1, sessions });
+		expect(parse).toThrow(ConfigError);
+		expect(parse).toThrow(field);
+	});
+}

@@ -284,3 +284,143 @@ test("Slack start is idempotent and can restart after stop", async () => {
 	expect(f.mode.connections).toBe(2);
 	f.mode.stop();
 });
+
+/** A socket whose TCP link is half-open: it accepts pings and never answers, closes, or errors. */
+class HalfOpenSocket extends FakeSocket {
+	readonly pings: number[] = [];
+	readonly listeners = new Map<string, (event: unknown) => void>();
+	constructor(
+		order: string[],
+		private readonly clock: () => number,
+	) {
+		super(order);
+	}
+	addEventListener(type: "ping" | "pong", listener: (event: unknown) => void) {
+		this.listeners.set(type, listener);
+	}
+	ping() {
+		this.pings.push(this.clock());
+	}
+	pong() {
+		this.listeners.get("pong")?.({});
+	}
+}
+
+function livenessFixture(livenessTimeoutMs = 15 * 60_000) {
+	let now = 1_000_000;
+	const order: string[] = [];
+	const sockets: HalfOpenSocket[] = [];
+	const logs: string[] = [];
+	const disconnects: string[] = [];
+	const delays: number[] = [];
+	const sleepers: (() => void)[] = [];
+	const ticks: { work: () => void; ms: number; cleared: boolean }[] = [];
+	const mode = new SlackSocketMode(
+		async () => ({ url: "wss://slack.test" }),
+		{
+			onEvent() {},
+			onSlashCommand() {},
+			onDisconnected(reason) {
+				disconnects.push(reason);
+			},
+		},
+		{
+			factory: () => {
+				const socket = new HalfOpenSocket(order, () => now);
+				sockets.push(socket);
+				return socket;
+			},
+			sleep: (ms) => {
+				delays.push(ms);
+				return new Promise((resolve) => sleepers.push(resolve));
+			},
+			random: () => 1,
+			log: { log: (line) => logs.push(String(line)), error: (line) => logs.push(String(line)) },
+			livenessTimeoutMs,
+			now: () => now,
+			setInterval: (work, ms) => {
+				const tick = { work, ms, cleared: false };
+				ticks.push(tick);
+				return tick;
+			},
+			clearInterval: (timer) => {
+				(timer as { cleared: boolean }).cleared = true;
+			},
+		},
+	);
+	/** Advance the clock and run every live watchdog tick, as a real interval would. */
+	const elapse = (ms: number) => {
+		now += ms;
+		for (const tick of ticks) if (!tick.cleared) tick.work();
+	};
+	return {
+		mode,
+		sockets,
+		logs,
+		disconnects,
+		delays,
+		sleepers,
+		ticks,
+		elapse,
+		async boot() {
+			const start = mode.start();
+			await flush();
+			sockets[0]?.open();
+			await start;
+		},
+	};
+}
+
+test("Slack half-open socket with no traffic is force-closed and the reconnect loop replaces it", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		socket.message({ type: "hello" });
+		expect(f.ticks).toHaveLength(1);
+		expect(f.ticks[0]?.ms).toBe(60_000);
+		// Quiet for half the window: the adapter probes rather than concluding anything.
+		f.elapse(8 * 60_000);
+		expect(socket.pings).toHaveLength(1);
+		expect(socket.closed).toHaveLength(0);
+		// The peer never answers; the full window elapses and the socket is retired.
+		f.elapse(8 * 60_000);
+		expect(socket.closed).toHaveLength(1);
+		expect(f.mode.connected).toBe(false);
+		expect(f.disconnects).toEqual(["Slack socket stale"]);
+		expect(f.logs.some((line) => line.includes("Slack socket stale"))).toBe(true);
+		expect(f.ticks[0]?.cleared).toBe(true);
+		await flush();
+		// The ordinary reconnect path owns the replacement: backoff, then a fresh socket.
+		expect(f.delays).toEqual([500]);
+		f.sleepers.shift()?.();
+		await flush();
+		f.sockets[1]?.open();
+		await flush();
+		expect(f.mode.connections).toBe(2);
+		expect(f.ticks).toHaveLength(2);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("Slack pongs and frames keep a quiet socket alive", async () => {
+	const f = livenessFixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as HalfOpenSocket;
+		socket.message({ type: "hello" });
+		f.elapse(8 * 60_000);
+		expect(socket.pings).toHaveLength(1);
+		socket.pong();
+		f.elapse(8 * 60_000);
+		expect(socket.closed).toHaveLength(0);
+		expect(socket.pings).toHaveLength(2);
+		socket.message(envelope("keepalive"));
+		f.elapse(14 * 60_000);
+		expect(socket.closed).toHaveLength(0);
+		expect(f.mode.connected).toBe(true);
+	} finally {
+		f.mode.stop();
+	}
+});

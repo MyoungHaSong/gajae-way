@@ -8,6 +8,7 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../src/config";
 import type { SessionRelayStream } from "../src/orchestrator/broker";
+import type { FailedTurnEvidence } from "../src/orchestrator/failed-turn-evidence";
 import type {
 	RunningHostJob,
 	SessionBindInput,
@@ -33,18 +34,21 @@ import {
 	type TailStreamSpawner,
 	type TurnCorrelation,
 } from "../src/orchestrator/tail-runner";
-import type { BrokerAuthority, GatewayDatabase } from "../src/store/db";
+import type { Store } from "../src/store";
+import type { BrokerAuthority } from "../src/store/groups/bindings";
 
 /** Initializes only a fresh test DB; never adopts legacy bindings or writes a GJC profile. */
-export function initializeTestBrokerAuthority(database: GatewayDatabase, canonicalAgentDir: string): BrokerAuthority {
+export function initializeTestBrokerAuthority(database: Store, canonicalAgentDir: string): BrokerAuthority {
 	const authority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
-	database.assertBrokerAuthority(authority, { initializeEmpty: true });
+	database.transaction((tx) =>
+		database.bindings.initializeAuthority(tx, authority, database.inspectBrokerAuthority().populated),
+	);
 	return authority;
 }
 
 /** Opt-in durable ownership for fake-backed harnesses; call before inserting app data. */
 export function attachTestBrokerOwnership<T extends SessionPort>(
-	database: GatewayDatabase,
+	database: Store,
 	port: T,
 	canonicalAgentDir: string,
 ): T {
@@ -52,17 +56,17 @@ export function attachTestBrokerOwnership<T extends SessionPort>(
 	const bind = port.bind.bind(port);
 	const resume = port.resume.bind(port);
 	port.bind = async (input) => {
-		database.assertBrokerAuthority(authority);
+		database.bindings.assertAuthority(authority);
 		const binding = await bind(input);
 		if (binding.originKey !== input.originKey || binding.repo !== input.repo || binding.epoch !== input.epoch)
 			throw new Error("test session binding does not match its creation request");
-		if (!database.recordOwnedBinding({ ...binding, authority }))
+		if (!database.transaction((tx) => database.bindings.recordOwnedBinding(tx, { ...binding, authority })))
 			throw new Error("test session binding lost to a durable epoch change");
 		return binding;
 	};
 	port.resume = async (input) => {
 		// Resume is not creation: seeded unknown IDs must never acquire provenance.
-		database.assertOwnedSession(input.sessionId, input.repo, authority);
+		database.bindings.assertOwnedSession(input.sessionId, input.repo, authority);
 		const binding = await resume(input);
 		if (
 			binding.sessionId !== input.sessionId ||
@@ -71,7 +75,7 @@ export function attachTestBrokerOwnership<T extends SessionPort>(
 			binding.epoch !== input.epoch
 		)
 			throw new Error("test session resume changed its binding identity");
-		database.assertOwnedSession(binding.sessionId, binding.repo, authority);
+		database.bindings.assertOwnedSession(binding.sessionId, binding.repo, authority);
 		return binding;
 	};
 	return port;
@@ -79,7 +83,7 @@ export function attachTestBrokerOwnership<T extends SessionPort>(
 
 /** Explicit successful gateway creation fixture, separate from the command spy under test. */
 export async function createOwnedSessionFixture(
-	database: GatewayDatabase,
+	database: Store,
 	authority: BrokerAuthority,
 	binding: { sessionId: string; originKey: string; epoch: number; repo: string },
 ): Promise<SessionBinding> {
@@ -316,10 +320,7 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	readonly failureEvidence = new Map<
-		string,
-		{ reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted" }
-	>();
+	readonly failureEvidence = new Map<string, FailedTurnEvidence>();
 	readonly failureEvidenceProbes: Array<{
 		sessionId: string;
 		repo: string;
@@ -339,11 +340,8 @@ export class ScriptedSessionPort implements SessionPort {
 		}
 	>();
 
-	setFailedTurnEvidence(
-		sessionId: string,
-		reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted",
-	): void {
-		this.failureEvidence.set(sessionId, { reason });
+	setFailedTurnEvidence(sessionId: string, reason: FailedTurnEvidence["reason"], retryAfterMs?: number): void {
+		this.failureEvidence.set(sessionId, retryAfterMs === undefined ? { reason } : { reason, retryAfterMs });
 	}
 
 	setFailedTransportCause(
@@ -374,7 +372,8 @@ export class ScriptedSessionPort implements SessionPort {
 		const operation = this.#operations.get(input.opRef);
 		if (!operation || operation.sessionId !== input.sessionId)
 			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
-		const startedAt = this.omitStartedAt ? {} : { startedAt: operation.startedAt };
+		const shouldOmit = this.omitStartedAt || operation.omitStartedAtForOp;
+		const startedAt = shouldOmit ? {} : { startedAt: operation.startedAt };
 		return {
 			operationRef: input.opRef,
 			status:
@@ -393,6 +392,8 @@ export class ScriptedSessionPort implements SessionPort {
 						? {
 								status: "failed",
 								...startedAt,
+								commandId: operation.commandId,
+								turnId: operation.turnId,
 								terminalAt: operation.terminalAt,
 								error: {
 									...(operation.errorCode ? { code: operation.errorCode } : {}),
@@ -415,6 +416,7 @@ export class ScriptedSessionPort implements SessionPort {
 		const fixture = this.#workerOutputFixtures.get(input.opRef);
 		if (fixture) return parseWorkerOutputResponse(input, fixture, Date.now());
 		const operation = this.#operations.get(input.opRef);
+		const shouldOmit = operation && (this.omitStartedAt || operation.omitStartedAtForOp);
 		const result =
 			!operation || operation.sessionId !== input.sessionId
 				? { status: "unknown" }
@@ -424,7 +426,7 @@ export class ScriptedSessionPort implements SessionPort {
 						...(operation.commandId ? { commandId: operation.commandId } : {}),
 						...(operation.turnId ? { turnId: operation.turnId } : {}),
 						status: operation.state,
-						...(this.omitStartedAt ? {} : { startedAt: operation.startedAt }),
+						...(shouldOmit ? {} : { startedAt: operation.startedAt }),
 						...(operation.terminalAt === undefined ? {} : { terminalAt: operation.terminalAt }),
 						...(operation.state === "terminal_ok"
 							? {
@@ -676,6 +678,7 @@ export class ScriptedSessionPort implements SessionPort {
 		operation.error = error;
 		if (detail.code !== undefined) operation.errorCode = detail.code;
 		if (detail.outcome !== undefined) operation.failureOutcome = detail.outcome;
+		if (detail.omitStartedAt !== undefined) operation.omitStartedAtForOp = detail.omitStartedAt;
 		operation.terminalAt = Date.now();
 		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_failed",
@@ -879,6 +882,7 @@ export function sessionPortFromScript(script: {
 export type ScriptedFailureDetail = {
 	readonly code?: string;
 	readonly outcome?: Record<string, string>;
+	readonly omitStartedAt?: boolean;
 };
 
 type Operation = {
@@ -892,6 +896,7 @@ type Operation = {
 	terminalAt?: number;
 	readonly commandId?: string;
 	readonly turnId?: string;
+	omitStartedAtForOp?: boolean;
 };
 
 /** Same fencing as ManagedTailHandle: only frames correlated to the turn it was told about are delivered. */

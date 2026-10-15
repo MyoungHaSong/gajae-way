@@ -414,9 +414,15 @@ export interface SessionBootstrapProjection {
 
 /**
  * Memory system surface (P3, spec fact 8): filesystem-first Markdown memory.
- * memory.audit runs the structural validator; memory.search is map-then-BM25
- * retrieval over the canonical tree. Both are read-only verbs.
+ * memory.audit runs the structural validator; memory.autolink commits canonical
+ * crosslinks; memory.search is map-then-BM25 retrieval over the canonical tree.
+ * Audit and autolink return an operation ID immediately and expose the outcome
+ * through memory.status, so client request timeouts do not imply operation failure.
  */
+export interface MemoryOperationAccepted {
+	readonly opRef: string;
+}
+
 export interface MemoryAuditResult {
 	readonly ok: boolean;
 	readonly issues: readonly {
@@ -424,6 +430,21 @@ export interface MemoryAuditResult {
 		readonly path: string;
 		readonly message: string;
 	}[];
+}
+
+export interface MemoryAutolinkResult {
+	readonly filesChanged: number;
+	readonly linksAdded: number;
+	readonly aliases: number;
+	readonly commitSha: string | null;
+	readonly elapsedMs: number;
+}
+
+export interface MemoryOperationStatusResult {
+	readonly status: "pending" | "completed" | "failed";
+	readonly elapsedMs: number;
+	readonly result?: MemoryAuditResult | MemoryAutolinkResult;
+	readonly error?: string;
 }
 
 export interface MemorySearchParams {
@@ -610,6 +631,8 @@ export interface WorkRunParams {
 	readonly text: string;
 	/** Working directory for the worker session (e.g. a repo checkout). */
 	readonly cwd?: string;
+	/** Repository binding: remote URL, configured alias, or repo key for worktree creation and push target (issue #480). */
+	readonly repo?: string;
 	/**
 	 * Explicit operator acknowledgement that lets a new attempt start while
 	 * the durable job is awaiting_operator (issue #10 hold semantics).
@@ -677,6 +700,12 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Repository binding information (issue #480) */
+	readonly repository?: {
+		readonly url: string;
+		readonly branch: string;
+		readonly base?: string;
+	};
 }
 
 export interface WorkSteerParams {
@@ -740,8 +769,25 @@ export type WorkRunResult =
 			readonly opRef: string;
 	  };
 
+/**
+ * One page of `work.jobs`, newest `updated_at` first. Paged because a home
+ * accumulates lane jobs without bound and the full projection outgrows the
+ * 1 MiB frame.
+ */
+export interface WorkJobsParams {
+	/** 1..WORK_JOBS_MAX_LIMIT; defaults to WORK_JOBS_DEFAULT_LIMIT. */
+	readonly limit?: number;
+	/** Rows to skip; defaults to 0. */
+	readonly offset?: number;
+}
+export const WORK_JOBS_DEFAULT_LIMIT = 100;
+export const WORK_JOBS_MAX_LIMIT = 500;
+
 /** Operator projection over durable lane jobs (issue #10). */
 export interface WorkJobsResult {
+	/** Every lane job in the home, not just this page. */
+	readonly total: number;
+	readonly offset: number;
 	readonly jobs: Array<{
 		readonly job_id: string;
 		readonly lane_key: string;
@@ -799,11 +845,15 @@ export type ConfigReloadResult =
  * refuses an emoji that origin cannot express rather than queueing a delivery
  * that can only fail. `reactionAllowlistFor(platform)` is what a caller should
  * offer.
+ *
+ * `action` defaults to "add"; removal is only allowed for reactions the persona
+ * itself added (tracked by the gateway). Removal frees budget entries.
  */
 export interface ChatReactParams {
 	readonly origin: OriginRef;
 	readonly targetMessageId: string;
 	readonly emoji: string;
+	readonly action?: ReactionAction;
 }
 
 export interface ChatReactResult {
@@ -876,6 +926,7 @@ export type CycleGateReason =
 	| "stale_session_identity"
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
+	| "memory_git_index_locked"
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
 	| "monitor_authoring_lost"
@@ -885,7 +936,8 @@ export type CycleGateReason =
 	| "gjc_unverified_version"
 	| "monitor_dispatch_failing"
 	| "broker_respawn_churn"
-	| "broker_index_lock_blocked";
+	| "broker_index_lock_blocked"
+	| "broker_agent_unprovisioned";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -923,6 +975,40 @@ export interface CycleSessionView {
 	/** Durable metadata-only bootstrap projection; source bodies are never exposed. */
 	readonly bootstrap: SessionBootstrapProjection;
 }
+export type SloDayStatus = "ok" | "failed" | "insufficient" | "pending";
+
+export interface SloDayResult {
+	readonly date: string;
+	readonly status: SloDayStatus;
+	readonly complete: boolean;
+	readonly aliveMs: number;
+	readonly maxUncoveredGapMs: number;
+	readonly broker_unavailable: number;
+	readonly persona_bind_failed: number;
+	readonly excluded: number;
+}
+
+export interface OpsSloWindow {
+	readonly id: string;
+	readonly trigger: string;
+	readonly state: string;
+	readonly requestedAt: string;
+	readonly finishedAt: string | null;
+	readonly verified: boolean;
+	readonly eligibleStart: string | null;
+	readonly eligibleEnd: string | null;
+	readonly overCapMs: number;
+}
+
+export interface OpsSloResult {
+	readonly days: readonly SloDayResult[];
+	readonly windows: readonly OpsSloWindow[];
+	readonly ok: boolean;
+}
+
+export interface OpsSloParams {
+	readonly days?: number;
+}
 
 export interface OpsCycleResult {
 	/** Aggregate runtime phase; "degraded" is emitted whenever gates is non-empty. */
@@ -946,6 +1032,8 @@ export interface OpsCycleResult {
 		readonly receipted: number;
 		readonly quarantined: number;
 	};
+	/** Observation-only memory git lock path and age; null when no lock is present. */
+	readonly memoryGitIndexLock: { readonly path: string; readonly ageMs: number } | null;
 	/** Monitor events not yet terminally settled, by stage. */
 	readonly monitorEvents: { readonly stage: string; readonly count: number }[];
 	/**
@@ -975,6 +1063,47 @@ export interface OpsCycleResult {
 	readonly lanes: { readonly active: number; readonly max: number };
 	/** Agent-directory disk headroom; null when no broker agent directory is bound. */
 	readonly agentDisk: AgentDiskView | null;
+	/** Broker-owned copy of the operator's allowlisted GJC agent inputs. */
+	readonly brokerAgent: {
+		readonly status: "provisioned" | "unprovisioned" | "interrupted";
+		readonly provisionedAt: string | null;
+		readonly genId: string | null;
+		readonly source: string | null;
+		readonly entries: readonly {
+			readonly name: string;
+			readonly kind: string;
+			readonly state:
+				| "in_sync"
+				| "source_changed"
+				| "copy_changed"
+				| "diverged"
+				| "missing_source"
+				| "missing_copy"
+				| "absent";
+		}[];
+	} | null;
+	/** Durable seven-day broker/persona SLO projection from meta evidence. */
+	readonly slo: OpsSloResult;
+}
+
+export interface OpsDeliveryRow {
+	readonly deliveryId: string;
+	readonly turnId: string;
+	readonly originKey: string;
+	readonly conversationId: string;
+	readonly state: string;
+	readonly createdAt: string;
+	readonly textPrefix: string;
+}
+
+export interface OpsDeliveriesParams {
+	readonly since?: string;
+	readonly state?: string;
+	readonly limit?: number;
+}
+
+export interface OpsDeliveriesResult {
+	readonly rows: readonly OpsDeliveryRow[];
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
@@ -989,11 +1118,9 @@ export interface VerbCatalogV01 {
 	"session.recall": { params: SessionRecallParams; result: SessionRecallResult };
 	"session.list": { params: undefined; result: SessionListResult };
 	"session.modelChoices": { params: undefined; result: SessionModelChoicesResult };
-	"memory.audit": { params: undefined; result: MemoryAuditResult };
-	"memory.autolink": {
-		params: undefined;
-		result: { readonly filesChanged: number; readonly linksAdded: number; readonly aliases: number };
-	};
+	"memory.audit": { params: undefined; result: MemoryOperationAccepted };
+	"memory.autolink": { params: undefined; result: MemoryOperationAccepted };
+	"memory.status": { params: { readonly opRef: string }; result: MemoryOperationStatusResult };
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
@@ -1022,15 +1149,19 @@ export interface VerbCatalogV01 {
 	};
 	"ops.redeliver": { params: OpsRedeliverParams; result: { readonly requeued: readonly string[] } };
 	"ops.integrity": { params: undefined; result: { readonly ok: boolean; readonly detail: string } };
+	"ops.deliveries": { params: OpsDeliveriesParams; result: OpsDeliveriesResult };
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
+
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
-	"work.jobs": { result: WorkJobsResult };
+	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
+	"ops.slo": { params: OpsSloParams; result: OpsSloResult };
+
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
 }
 
@@ -1055,6 +1186,7 @@ export const VERBS_V01 = [
 	"memory.audit",
 	"memory.autolink",
 	"memory.search",
+	"memory.status",
 	"monitor.add",
 	"monitor.update",
 	"monitor.list",
@@ -1064,6 +1196,7 @@ export const VERBS_V01 = [
 	"ops.backup",
 	"ops.redeliver",
 	"ops.integrity",
+	"ops.deliveries",
 	"work.run",
 	"work.start",
 	"work.status",
@@ -1074,6 +1207,7 @@ export const VERBS_V01 = [
 	"engagement.reaction",
 	"engagement.panel_response",
 	"gateway.reloadConfig",
+	"ops.slo",
 	"ops.cycle",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;

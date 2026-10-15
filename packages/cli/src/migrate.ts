@@ -1,5 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { acquireLease, type Lease, LeaseHeldError } from "@gajae-gateway/home";
 import { detectHermes, readHermes } from "./migrate/hermes";
 import { detectOpenClaw, readOpenClaw } from "./migrate/openclaw";
 import {
@@ -23,9 +25,26 @@ export interface MigrateOptions {
  * reads its configuration, and writes the gajae-way-compatible output.
  */
 export async function migrate(options: MigrateOptions): Promise<void> {
-	const sourceRoot = expandHome(options.source ?? ".");
-	const targetHome = expandHome(options.target ?? `${process.env.HOME ?? "~"}/.gajaeway`);
+	const targetHome = expandHome(options.target ?? process.env.GAJAEWAY_HOME ?? `${process.env.HOME ?? "~"}/.gajaeway`);
+	if (options.dryRun) return migrateUnlocked(options, targetHome);
 
+	let lease: Lease;
+	try {
+		lease = await acquireLease(targetHome, "memory");
+	} catch (error) {
+		if (error instanceof LeaseHeldError)
+			throw new Error(`${error.message}; stop the gateway first before importing memory data`, { cause: error });
+		throw error;
+	}
+	try {
+		await migrateUnlocked(options, targetHome);
+	} finally {
+		await lease.release();
+	}
+}
+
+async function migrateUnlocked(options: MigrateOptions, targetHome: string): Promise<void> {
+	const sourceRoot = expandHome(options.source ?? ".");
 	// Detect source type
 	let sourceType: MigrationSource | undefined;
 	if (await detectHermes(sourceRoot)) {
@@ -109,7 +128,20 @@ export async function migrate(options: MigrateOptions): Promise<void> {
 	for (const file of extract.files) {
 		const filePath = join(targetHome, file.target);
 		await mkdir(join(filePath, ".."), { recursive: true });
-		await writeFile(filePath, file.content);
+		if (file.secret) {
+			// Atomic 0600 write for secrets
+			const temporary = `${filePath}.${randomUUID()}.tmp`;
+			try {
+				await writeFile(temporary, file.content, { mode: 0o600 });
+				await chmod(temporary, 0o600);
+				await rename(temporary, filePath);
+			} catch (error) {
+				await rm(temporary, { force: true });
+				throw error;
+			}
+		} else {
+			await writeFile(filePath, file.content);
+		}
 	}
 
 	// Write merged JSON files

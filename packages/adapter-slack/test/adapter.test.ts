@@ -159,6 +159,7 @@ async function fixture(
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			recoveryCursorPath,
 			now: () => 1_700_000_100_000,
 			log: { log() {}, error() {} },
@@ -207,13 +208,16 @@ for (const shape of [
 			await f.event({ ...inbound(shape) });
 			const dm = shape.channel === "D1";
 			const thread = "thread_ts" in shape;
+			// A thread rooted at the bot's own message routes to the channel session (see decideInbound),
+			// while replyTo still names the thread so the answer lands where the human wrote.
+			const threadSession = thread && shape.parent_user_id !== "UBOT";
 			expect(f.client.requests).toEqual([
 				{
 					verb: "chat.send",
 					params: {
 						origin: dm
 							? { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" }
-							: thread
+							: threadSession
 								? { platform: "slack", kind: "thread", conversationId: `C1:${shape.thread_ts}`, parentId: "C1" }
 								: origin,
 						messageId: `${shape.channel}:1700000000.123456`,
@@ -304,6 +308,41 @@ test("Slack mention, open-channel and parent-bot promotion; bot authors remain m
 		channelLabel: "#general",
 		serverLabel: "Workspace",
 	});
+});
+
+test("Slack thread reply under the bot's own message continues the channel session; a human-rooted thread stays isolated", () => {
+	// Reply threaded under the bot's answer: origin collapses to the channel (same session), while
+	// replyTo still names the thread so the answer lands where the human wrote.
+	const underBot = decideInbound(
+		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "UBOT", text: "and then?" }),
+		identity,
+		names,
+		undefined,
+	);
+	expect(underBot?.origin).toEqual({ platform: "slack", kind: "channel", conversationId: "C1" });
+	expect(underBot?.engagement.replyTo).toEqual({ messageId: "C1:1700000001.000000", authorId: "UBOT", fromSelf: true });
+	expect(underBot?.engagement.mentioned).toBe(true);
+	// Thread a human started on their own message: its own origin and session.
+	const underHuman = decideInbound(
+		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", parent_user_id: "U9", text: "side talk" }),
+		identity,
+		names,
+		undefined,
+	);
+	expect(underHuman?.origin).toEqual({
+		platform: "slack",
+		kind: "thread",
+		conversationId: "C1:1700000001.000000",
+		parentId: "C1",
+	});
+	// Thread with no parent author info (Slack omitted parent_user_id): unchanged, isolated.
+	const unknownRoot = decideInbound(
+		inbound({ ts: "1700000002.000000", thread_ts: "1700000001.000000", text: "?" }),
+		identity,
+		names,
+		undefined,
+	);
+	expect(unknownRoot?.origin.kind).toBe("thread");
 });
 
 test("Slack rendering preserves attachments and primes at most ten mentioned users", async () => {
@@ -872,6 +911,7 @@ test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			// Never the ambient $GAJAEWAY_HOME store: this process may be a real host.
 			recoveryCursorPath: join(tmpdir(), `slack-recovery-${crypto.randomUUID()}.json`),
 			log: { log() {}, error() {} },
@@ -1297,6 +1337,7 @@ test("Slack recovery gate times socket and gateway outages independently", async
 		},
 		{
 			api,
+			connectGateway: async () => {},
 			recoveryCursorPath: join(
 				tmpdir(),
 				`slack-recovery-${crypto.randomUUID()}`,

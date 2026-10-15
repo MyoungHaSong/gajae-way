@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type ChannelEngagementPolicy, ENGAGEMENT_AUDIENCES, ENGAGEMENT_MODES } from "@gajae-gateway/protocol";
+import { MIN_SOCKET_LIVENESS_TIMEOUT_MS } from "./socket";
 
 export interface SlackAdapterConfig {
 	readonly botTokenFile: string;
@@ -14,6 +15,12 @@ export interface SlackAdapterConfig {
 	 * message per part, matching the reaction-gradient presence design.
 	 */
 	readonly liveReplies?: boolean;
+	/**
+	 * Force-close the Socket Mode connection after this many milliseconds without
+	 * any frame, ping, or pong from Slack so the reconnect loop replaces a
+	 * half-open socket. Default 15 minutes; minimum 30 seconds.
+	 */
+	readonly socketLivenessTimeoutMs?: number;
 }
 
 export interface LoadedSlackAdapterConfig extends SlackAdapterConfig {
@@ -56,6 +63,15 @@ export async function loadSlackAdapterConfig(env: NodeJS.ProcessEnv = process.en
 	}
 	if (config.liveReplies !== undefined && typeof config.liveReplies !== "boolean") {
 		throw new SlackAdapterStartupError("Slack adapter liveReplies must be a boolean when set.");
+	}
+	if (
+		config.socketLivenessTimeoutMs !== undefined &&
+		(!Number.isInteger(config.socketLivenessTimeoutMs) ||
+			(config.socketLivenessTimeoutMs as number) < MIN_SOCKET_LIVENESS_TIMEOUT_MS)
+	) {
+		throw new SlackAdapterStartupError(
+			`Slack adapter socketLivenessTimeoutMs must be an integer of at least ${MIN_SOCKET_LIVENESS_TIMEOUT_MS} when set.`,
+		);
 	}
 	if (config.channels !== undefined && !validChannels(config.channels)) {
 		throw new SlackAdapterStartupError(
