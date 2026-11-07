@@ -124,6 +124,8 @@ async function harness(
 test("R1 concurrent new names cannot overbook the final slot", async () => {
 	const binding = deferred();
 	const release = deferred();
+	const existingStarted = deferred();
+	const finish = deferred();
 	let delay = false;
 	const h = await harness(2, {
 		beforeBind: async () => {
@@ -132,8 +134,15 @@ test("R1 concurrent new names cannot overbook the final slot", async () => {
 				await release.promise;
 			}
 		},
+		// Every turn stays open, so no settled lane can be retired to make room.
+		onSend: async (input, port) => {
+			existingStarted.resolve();
+			await finish.promise;
+			port.complete(input.opRef, "done");
+		},
 	});
-	await h.run("existing");
+	const existing = h.run("existing");
+	await existingStarted.promise;
 	delay = true;
 	const first = h.run("first");
 	await binding.promise;
@@ -141,9 +150,28 @@ test("R1 concurrent new names cannot overbook the final slot", async () => {
 	// Keep the first bind unpublished while the other name reaches admission.
 	await Bun.sleep(30);
 	release.resolve();
-	const results = await Promise.all([first, second]);
+	const refused = await Promise.race([first, second]);
+	expect(refused.error?.code).toBe("lane_capacity");
 	expect(h.database.bindings.workLaneRows().length).toBeLessThanOrEqual(2);
+	finish.resolve();
+	const results = await Promise.all([existing, first, second]);
 	expect(results.filter((frame) => frame.error?.code === "lane_capacity")).toHaveLength(1);
+});
+
+test("R1b a new name past the cap retires a settled lane instead of refusing", async () => {
+	const h = await harness(2);
+	await h.run("old");
+	await Bun.sleep(15);
+	await h.run("fresh");
+	const admitted = await h.run("third");
+	expect(admitted.type).toBe("response");
+	expect(
+		h.database.bindings
+			.workLaneRows()
+			.map((row) => row.origin_key)
+			.sort(),
+	).toEqual(["work/task/fresh", "work/task/third"]);
+	expect(h.port.closes).toHaveLength(1);
 });
 
 test("R2 retire refuses an open live turn without waiting for it to finish", async () => {
@@ -207,12 +235,26 @@ test("R4 invalid models and name boundaries fail closed; valid model reaches bin
 });
 
 test("R5 capacity details include every candidate sorted idlest first", async () => {
-	const h = await harness(3);
+	const finish = deferred();
+	let started = 0;
+	// Every turn stays open, so no settled lane can be retired to make room.
+	const h = await harness(3, {
+		onSend: async (input, port) => {
+			started++;
+			await finish.promise;
+			port.complete(input.opRef, "done");
+		},
+	});
+	const running = [];
 	for (const name of ["old", "middle", "fresh"]) {
-		await h.run(name);
+		const before = started;
+		running.push(h.run(name));
+		for (let i = 0; i < 400 && started === before; i++) await Bun.sleep(5);
 		await Bun.sleep(15);
 	}
 	const result = await h.run("fourth");
+	finish.resolve();
+	await Promise.all(running);
 	expect(result.error?.code).toBe("lane_capacity");
 	const detail = result.error.detail;
 	expect(detail).toMatchObject({ active: 3, maxLanes: 3 });

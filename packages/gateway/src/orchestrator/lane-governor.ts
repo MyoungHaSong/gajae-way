@@ -65,6 +65,15 @@ export interface ActiveLane {
 	readonly attemptOpen: boolean;
 }
 
+/**
+ * Admission may retire only a settled lane that no longer owns live follow-up:
+ * an `awaiting_checks` lane keeps its session for the checks poller, and
+ * retiring it would conclude that cycle just to free a slot.
+ */
+function admissionRetirable(lane: ActiveLane): boolean {
+	return !lane.attemptOpen && lane.state !== "awaiting_checks";
+}
+
 export type LaneRetireOutcome =
 	| {
 			readonly retired: true;
@@ -77,10 +86,14 @@ export type LaneRetireOutcome =
 
 export type SweepReason = "idle" | "job_done" | "job_aborted";
 
-/** What a sweep observed when it nominated a lane; re-proven under the lane lock. */
+/**
+ * What a sweep or admission observed when it nominated a lane; re-proven under
+ * the lane lock. `admission` nominates any settled lane to free a slot for a
+ * new lane name, so its only predicate is that no attempt is open.
+ */
 export interface SweepNomination {
 	readonly sessionId: string;
-	readonly reason: SweepReason;
+	readonly reason: SweepReason | "admission";
 	/** The sweep's clock; the locked recheck evaluates fresh state at this time or later. */
 	readonly now: number;
 }
@@ -164,10 +177,58 @@ export class LaneGovernor {
 		});
 	}
 
+	/** Lanes counted against maxLanes: quarantined lanes do not count. */
+	#countedLanes(now = this.#now()): ActiveLane[] {
+		return this.activeLanes(now).filter(
+			(lane) => !this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId),
+		);
+	}
+
+	/**
+	 * Frees one slot for a new lane name when the cap is reached, by retiring a
+	 * settled lane (no open attempt): terminal jobs first, then the idlest. A
+	 * finished lane otherwise keeps its slot until the idle sweep, so a full cap
+	 * of finished lanes would refuse new work while nothing runs. The retired
+	 * lane keeps its job record and worktree; its next start binds a fresh
+	 * session. Runs outside the admission lock: retirement takes the victim's
+	 * lane lock, and a resuming lane holds its own lane lock while it waits for
+	 * admission. `assertAdmission` re-checks capacity under the admission lock.
+	 */
+	async makeRoom(name: string): Promise<void> {
+		if (this.#stopped) return;
+		const now = this.#now();
+		const lanes = this.#countedLanes(now);
+		if (lanes.some((lane) => lane.name === name) || lanes.length < this.maxLanes) return;
+		const candidates = lanes
+			.filter(admissionRetirable)
+			.sort(
+				(left, right) =>
+					Number(TERMINAL_JOB_STATES.has(right.state)) - Number(TERMINAL_JOB_STATES.has(left.state)) ||
+					right.idleMs - left.idleMs,
+			);
+		for (const lane of candidates) {
+			try {
+				const outcome = await this.retire(lane.name, "admission", {
+					sessionId: lane.sessionId,
+					reason: "admission",
+					now,
+				});
+				if (outcome.retired) return;
+				this.#log(
+					`lane_admission_retire_skipped name=${lane.name} for=${name} reason=${sanitizeDiagnostic(outcome.reason)}`,
+				);
+			} catch (error) {
+				const detail = sanitizeDiagnostic(diagnostic(error));
+				this.#log(`lane_retire_failed name=${lane.name} session=${lane.sessionId} reason=${detail}`);
+			}
+		}
+	}
+
 	/**
 	 * A name that already owns a bound lane is always admitted (it resumes its
 	 * own session). A new name past the cap is refused with the idlest lanes as
-	 * retirement candidates, so the caller frees a slot deliberately.
+	 * retirement candidates; callers run `makeRoom` first, so a refusal means
+	 * every counted lane has an open attempt or could not be proven settled.
 	 * Quarantined lanes do not count against maxLanes.
 	 */
 	assertAdmission(name: string): void {
@@ -178,11 +239,7 @@ export class LaneGovernor {
 				jobId,
 				name,
 			});
-		const allLanes = this.activeLanes();
-		// Filter out quarantined lanes from capacity count
-		const lanes = allLanes.filter(
-			(lane) => !this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId),
-		);
+		const lanes = this.#countedLanes();
 		if (lanes.some((lane) => lane.name === name)) return;
 		if (lanes.length < this.maxLanes) return;
 		const detail: LaneCapacityDetail = {
@@ -198,7 +255,7 @@ export class LaneGovernor {
 		};
 		throw new ProtocolError(
 			"lane_capacity",
-			`work lanes are at capacity (${lanes.length}/${this.maxLanes}); retire one with work.retire before starting ${name}`,
+			`work lanes are at capacity (${lanes.length}/${this.maxLanes}) and none could be retired automatically; wait for a lane to finish before starting ${name}`,
 			detail,
 		);
 	}
@@ -257,7 +314,10 @@ export class LaneGovernor {
 			if (expected && lane.sessionId !== expected.sessionId)
 				return { retired: false, sessionKey, reason: `lane was rebound to ${lane.sessionId} since it was selected` };
 			if (lane.attemptOpen) return unsettled(sessionKey, lane);
-			if (expected && this.#sweepReason(lane) !== expected.reason)
+			if (
+				expected &&
+				(expected.reason === "admission" ? !admissionRetirable(lane) : this.#sweepReason(lane) !== expected.reason)
+			)
 				return { retired: false, sessionKey, reason: `lane no longer qualifies for ${expected.reason} retirement` };
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;

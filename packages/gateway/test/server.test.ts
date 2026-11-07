@@ -4170,7 +4170,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	client.close();
 });
 
-test("work capacity rejects new lanes, permits reuse, and work.retire frees the slot with jobs activity visible", async () => {
+test("work capacity permits reuse, retires a settled lane for a new name, and work.retire frees the slot with jobs activity visible", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -4203,20 +4203,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	const first = client.frames.find((frame) => frame.id === "first");
 	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
 	const sessionId = database.bindings.getSessionRecord("work/task/a")!.sessionId;
-	client.send({
-		v: "0.1",
-		type: "request",
-		id: "full",
-		verb: "work.run",
-		params: { name: "b", text: "work", cwd: directory },
-	});
-	await waitFor(client.frames, 3);
-	expect(client.frames.find((frame) => frame.id === "full")).toMatchObject({
-		type: "error",
-		error: { code: "lane_capacity", detail: { active: 1, maxLanes: 1, candidates: [{ name: "a" }] } },
-	});
 	expect(sessionPort.binds).toHaveLength(1);
-	expect(sessionPort.sends).toHaveLength(1);
 	client.send({
 		v: "0.1",
 		type: "request",
@@ -4224,7 +4211,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 		verb: "work.run",
 		params: { name: "a", text: "again", cwd: directory },
 	});
-	await waitFor(client.frames, 4);
+	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.id === "reuse")).toMatchObject({
 		type: "response",
 		result: { held: false, sessionKey: "work/task/a" },
@@ -4232,7 +4219,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	expect(sessionPort.sends).toHaveLength(2);
 	expect(sessionPort.sends[1].sessionId).toBe(sessionId);
 	client.send({ v: "0.1", type: "request", id: "jobs-active", verb: "work.jobs" });
-	await waitFor(client.frames, 5);
+	await waitFor(client.frames, 4);
 	const jobs = client.frames.find((frame) => frame.id === "jobs-active");
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(Number.isFinite(Date.parse(jobs.result.jobs[0].last_activity_at))).toBe(true);
@@ -4240,27 +4227,43 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 		session_id: sessionId,
 		last_activity_at: expect.any(String),
 	});
-	client.send({ v: "0.1", type: "request", id: "retire", verb: "work.retire", params: { name: "a" } });
-	await waitFor(client.frames, 6);
-	expect(client.frames.find((frame) => frame.id === "retire")).toMatchObject({
+	// The cap is full of a settled lane: a new name retires it instead of being refused.
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "replaced",
+		verb: "work.run",
+		params: { name: "b", text: "work", cwd: directory },
+	});
+	await waitFor(client.frames, 5);
+	expect(client.frames.find((frame) => frame.id === "replaced")).toMatchObject({
 		type: "response",
-		result: { retired: true, sessionKey: "work/task/a", sessionId, closed: true },
+		result: { held: false, sessionKey: "work/task/b", text: "worker result" },
 	});
 	expect(sessionPort.closes).toEqual([{ sessionId, repo: directory }]);
 	expect(database.bindings.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: 1 });
+	const sessionB = database.bindings.getSessionRecord("work/task/b")!.sessionId;
+	client.send({ v: "0.1", type: "request", id: "retire", verb: "work.retire", params: { name: "b" } });
+	await waitFor(client.frames, 6);
+	expect(client.frames.find((frame) => frame.id === "retire")).toMatchObject({
+		type: "response",
+		result: { retired: true, sessionKey: "work/task/b", sessionId: sessionB, closed: true },
+	});
+	expect(database.bindings.getSessionRecord("work/task/b")).toEqual({ sessionId: "", epoch: 1 });
 	client.send({
 		v: "0.1",
 		type: "request",
 		id: "freed",
 		verb: "work.run",
-		params: { name: "b", text: "work", cwd: directory },
+		params: { name: "a", text: "resume", cwd: directory },
 	});
 	await waitFor(client.frames, 7);
 	expect(client.frames.find((frame) => frame.id === "freed")).toMatchObject({
 		type: "response",
-		result: { held: false, sessionKey: "work/task/b", text: "worker result" },
+		result: { held: false, sessionKey: "work/task/a", text: "worker result" },
 	});
-	expect(sessionPort.sends).toHaveLength(3);
+	expect(sessionPort.closes).toHaveLength(2);
+	expect(sessionPort.sends).toHaveLength(4);
 	client.close();
 });
 

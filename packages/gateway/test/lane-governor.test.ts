@@ -10,6 +10,7 @@ import {
 	createLaneJobRecord,
 	type LaneJobRecord,
 	newOpRef,
+	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { BrokerAuthorityError, Store } from "../src/store";
@@ -102,6 +103,99 @@ test("admission admits existing lanes at capacity and reports new-name candidate
 			],
 		},
 	});
+});
+
+test("makeRoom frees a slot for a new name by retiring a settled lane, terminal jobs before the idlest", async () => {
+	database = await Store.open(":memory:");
+	bind("busy", NOW - 600_000, SESSION_ID);
+	persistJob("busy", "running", true);
+	bind("idle", NOW - 300_000);
+	persistJob("idle", "running");
+	bind("done", NOW - 1_000);
+	persistJob("done", "done");
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		maxLanes: 3,
+		now: () => NOW,
+		log: (line) => logs.push(line),
+	});
+	await governor.makeRoom("new");
+	expect(port.closes.map((close) => close.sessionId)).toEqual(["sess-done"]);
+	expect(() => governor.assertAdmission("new")).not.toThrow();
+	expect(logs).toContain("lane_retired name=done session=sess-done reason=admission closed=true");
+	// The next new name takes the idlest settled lane; the busy lane is never chosen.
+	bind("new", NOW);
+	persistJob("new", "running", true);
+	await governor.makeRoom("newer");
+	expect(port.closes.map((close) => close.sessionId)).toEqual(["sess-done", "sess-idle"]);
+	expect(
+		governor
+			.activeLanes()
+			.map((lane) => lane.name)
+			.sort(),
+	).toEqual(["busy", "new"]);
+});
+
+test("makeRoom retires nothing below the cap, for a bound name, or when every lane is running", async () => {
+	database = await Store.open(":memory:");
+	bind("settled", NOW - 60_000);
+	persistJob("settled", "running");
+	const port = new ScriptedSessionPort();
+	const governor = new LaneGovernor({ database, sessionPort: port, maxLanes: 2, now: () => NOW });
+	await governor.makeRoom("new");
+	bind("busy", NOW - 60_000, SESSION_ID);
+	persistJob("busy", "running", true);
+	await governor.makeRoom("settled");
+	expect(port.closes).toEqual([]);
+	persistJob("settled", "running", true);
+	await governor.makeRoom("new");
+	expect(port.closes).toEqual([]);
+	expect(() => governor.assertAdmission("new")).toThrow(ProtocolError);
+});
+
+test("makeRoom never retires a lane awaiting checks, so its checks cycle keeps monitoring", async () => {
+	database = await Store.open(":memory:");
+	bind("checks", NOW - 600_000, SESSION_ID);
+	const identity = laneJobIdentity("checks");
+	const opRef = newOpRef("governor-checks");
+	let record: LaneJobRecord = createLaneJobRecord({
+		jobId: identity.jobId,
+		branch: "work/checks",
+		worktreePath: "/tmp/worker-repo",
+		now: () => new Date(NOW - 900_000),
+	});
+	record = appendAttempt(record, { opRef, sessionId: SESSION_ID, startedAt: new Date(NOW - 800_000).toISOString() });
+	record = closeAttempt({ record, opRef, endState: "completed", endedAt: new Date(NOW - 700_000).toISOString() });
+	record = transitionToAwaitingChecks({
+		record,
+		at: new Date(NOW - 650_000).toISOString(),
+		prNumber: 7,
+		headSha: "a".repeat(40),
+	});
+	expect(record.state).toBe("awaiting_checks");
+	database.transaction((tx) =>
+		database.work.putLaneJob(tx, { ...record, laneKey: identity.laneKey, json: JSON.stringify(record) }),
+	);
+	const port = new ScriptedSessionPort();
+	const settlements: string[] = [];
+	const governor = new LaneGovernor({ database, sessionPort: port, maxLanes: 1, now: () => NOW });
+	governor.setForceRetireSettlement((name) => {
+		settlements.push(name);
+		return true;
+	});
+	await governor.makeRoom("new");
+	expect(port.closes).toEqual([]);
+	expect(settlements).toEqual([]);
+	const outcome = await governor.retire("checks", "admission", {
+		sessionId: SESSION_ID,
+		reason: "admission",
+		now: NOW,
+	});
+	expect(outcome).toMatchObject({ retired: false, reason: "lane no longer qualifies for admission retirement" });
+	expect(() => governor.assertAdmission("new")).toThrow(ProtocolError);
 });
 
 test("retire closes the session in its job repo, clears the binding, bumps epoch, and logs", async () => {

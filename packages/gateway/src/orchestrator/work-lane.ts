@@ -1015,6 +1015,8 @@ export class WorkLaneManager {
 		let worktreePersisted = false;
 		let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 		try {
+			await this.#options.lanes.makeRoom(input.name);
+			this.#live();
 			// Each try re-takes the admission lock and re-checks capacity, so a
 			// lane waiting out a broker restart does not hold other lanes' admission.
 			// Only an unavailable broker is retried; every other bind failure is final.
