@@ -8,6 +8,7 @@ import {
 	type PersonaBindHoldInput,
 	PersonaSessionManager,
 	personaTurnOpRef,
+	STALE_RETIRED_HOLD_MS,
 	UNRESOLVED_HOLD_ESCALATED,
 } from "../src/orchestrator/persona-session";
 import { Store } from "../src/store";
@@ -82,7 +83,14 @@ function endpointStale(): Error {
 
 async function heldOrigin(
 	name: string,
-	options: { heldForMs: number; live: boolean; reuseHome?: boolean; newerMessage?: boolean; clock?: VirtualClock },
+	options: {
+		heldForMs: number;
+		live: boolean;
+		reuseHome?: boolean;
+		newerMessage?: boolean;
+		clock?: VirtualClock;
+		staleRetiredHoldMs?: number;
+	},
 ) {
 	if (!options.reuseHome) home = await mkdtemp(join(tmpdir(), "gajaeway-unresolved-hold-"));
 	database = await Store.open(join(home, "gateway.db"));
@@ -127,6 +135,7 @@ async function heldOrigin(
 			instanceId: "hold-test",
 			repo,
 			unresolvedHoldMs: 10 * MINUTE,
+			...(options.staleRetiredHoldMs === undefined ? {} : { staleRetiredHoldMs: options.staleRetiredHoldMs }),
 			...(options.clock ? options.clock.managerOptions() : {}),
 			log: (line: string) => logs.push(line),
 			onBindHold: (input) => {
@@ -464,7 +473,14 @@ test("an unchanged recovery hold is logged once across sweeps, not on every scan
 
 test("an escalated hold whose session stays endpoint_stale keeps holding, read only by the per-minute sweep, also across a restart (#715)", async () => {
 	const clock = new VirtualClock();
-	const f = await heldOrigin("endpoint-stale", { heldForMs: 11 * MINUTE, live: false, clock });
+	// Measures read cadence within one held hour, so the stale-hold expiry
+	// (covered by its own tests below) is moved out of the window.
+	const f = await heldOrigin("endpoint-stale", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		staleRetiredHoldMs: 24 * 60 * MINUTE,
+	});
 	try {
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
@@ -518,7 +534,14 @@ test("an escalated hold whose session stays endpoint_stale keeps holding, read o
 
 test("an escalated hold whose status is only transiently unreadable keeps holding (#715)", async () => {
 	const clock = new VirtualClock();
-	const f = await heldOrigin("transient-stale", { heldForMs: 11 * MINUTE, live: false, clock });
+	// Measures read cadence within one held hour, so the stale-hold expiry
+	// (covered by its own tests below) is moved out of the window.
+	const f = await heldOrigin("transient-stale", {
+		heldForMs: 11 * MINUTE,
+		live: false,
+		clock,
+		staleRetiredHoldMs: 24 * 60 * MINUTE,
+	});
 	try {
 		await f.manager.recover();
 		await until(() => f.port.sends.length === 1);
@@ -538,6 +561,91 @@ test("an escalated hold whose status is only transiently unreadable keeps holdin
 		expect(reads).toBeGreaterThanOrEqual(60);
 		expect(reads).toBeLessThanOrEqual(64);
 		expect(f.db.inbox.turnRow(f.heldOpRef)?.turn_state).not.toBe("done");
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a retired-epoch hold whose state stays unknown is closed past STALE_RETIRED_HOLD_MS, never resent", async () => {
+	const f = await heldOrigin("stale-retired", { heldForMs: STALE_RETIRED_HOLD_MS + MINUTE, live: false });
+	const holds = () => f.logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(f.heldOpRef)).length;
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.db.bindings.getSessionRecord(f.originKey)?.epoch).toBe(1);
+		// Escalation retires its epoch; already past the bound, it is then closed.
+		await f.manager.reconcile(f.originKey);
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.state !== "pending");
+		expect(
+			f.logs.filter((line) => line.startsWith("retired_turn_closed") && line.includes("reason=stale_retired_hold")),
+		).toHaveLength(1);
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		const before = holds();
+		await f.manager.recover();
+		await f.manager.reconcile(f.originKey);
+		expect(holds()).toBe(before);
+		expect(f.notices).toHaveLength(1);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a retired-epoch hold younger than STALE_RETIRED_HOLD_MS keeps reconciling", async () => {
+	const f = await heldOrigin("young-retired", { heldForMs: 11 * MINUTE, live: false });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		await f.manager.recover();
+		await f.manager.reconcile(f.originKey);
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.state).toBe("pending");
+		expect(f.logs.some((line) => line.startsWith("retired_turn_closed"))).toBe(false);
+	} finally {
+		await f.manager.stop();
+	}
+});
+
+test("a stale escalated hold on an unanswering host expires, stops being probed, and no longer blocks the restart drain", async () => {
+	const clock = new VirtualClock();
+	const f = await heldOrigin("stale-drain", { heldForMs: 11 * MINUTE, live: false, clock });
+	try {
+		await f.manager.recover();
+		await until(() => f.port.sends.length === 1);
+		expect(f.notices).toHaveLength(1);
+		let reads = 0;
+		const status = f.port.status.bind(f.port);
+		f.port.status = async (input) => {
+			if (input.opRef !== f.heldOpRef) return await status(input);
+			reads++;
+			throw endpointStale();
+		};
+		// The host never answers again: liveness is indeterminate, not dead.
+		f.port.liveness = async () => ({ live: undefined, disowned: false });
+		const sweep = async () => {
+			await clock.advance(MINUTE);
+			await f.manager.recover();
+			await f.manager.reconcile(f.originKey);
+		};
+		// Held 11 minutes; the retired hold still fences the restart drain.
+		await sweep();
+		expect(await f.manager.drainForRestart("drain-early", 0)).toBe("timed_out");
+		await f.manager.cancelRestartDrain("drain-early");
+		for (let minute = 12; minute < 30; minute++) await sweep();
+		expect(f.db.inbox.turnRow(f.heldOpRef)?.state).toBe("pending");
+		expect(f.logs.some((line) => line.startsWith("retired_turn_closed"))).toBe(false);
+		// Thirty minutes after the send it is closed as retired, once.
+		await sweep();
+		await sweep();
+		await until(() => f.db.inbox.turnRow(f.heldOpRef)?.state !== "pending");
+		const closed = f.logs.filter((line) => line.startsWith("retired_turn_closed") && line.includes(f.heldOpRef));
+		expect(closed).toHaveLength(1);
+		expect(closed[0]).toContain("reason=stale_retired_hold");
+		// No more probes, no resend, no second notice, and the drain completes.
+		const readsAtClose = reads;
+		for (let minute = 0; minute < 10; minute++) await sweep();
+		expect(reads).toBe(readsAtClose);
+		expect(f.port.sendAttempts.filter((send) => send.opRef === f.heldOpRef)).toHaveLength(0);
+		expect(f.notices).toHaveLength(1);
+		expect(await f.manager.drainForRestart("drain-late", 0)).toBe("drained");
 	} finally {
 		await f.manager.stop();
 	}

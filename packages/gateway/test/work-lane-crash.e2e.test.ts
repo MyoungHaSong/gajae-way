@@ -138,9 +138,31 @@ test("accepted start survives SIGKILL with same live unknown operation, then set
 	singleEffect(f, receipt.opRef, receipt.sessionId);
 }, 30_000);
 
+test("restart with an unanswered liveness probe keeps observing the same attempt", async () => {
+	const f = await fixture();
+	const { receipt } = await start(f);
+	await f.kill();
+	await f.control(receipt.opRef, { live: "indeterminate", unknown: true });
+	const attachesBefore = f.calls("attach").length;
+	await f.start();
+	const client = await f.connect();
+	await eventually(
+		() => f.calls("attach").length,
+		(attaches) => attaches > attachesBefore,
+		"recovery reattaches the observer",
+	);
+	await Bun.sleep(200);
+	expect(f.snapshot().runtimes[0].settledAt).toBeNull();
+	expect(f.snapshot().jobs[0].attempts[0].endedAt).toBeUndefined();
+	await f.control(receipt.opRef, { live: "live", unknown: false, terminal: true, text: "same worker final answer" });
+	const snapshot = await settled(f);
+	expect(snapshot.jobs[0].attempts[0].endState).toBe("completed");
+	expect((await notice(client)).payload.text).toBe("[lane crash] completed: same worker final answer");
+	singleEffect(f, receipt.opRef, receipt.sessionId);
+}, 30_000);
+
 for (const [live, reason] of [
 	["dead", "session_dead"],
-	["indeterminate", "recovery_indeterminate"],
 	["disowned", "session_disowned"],
 ] as const) {
 	test(`restart ${live} authority holds uncertainty without replacement`, async () => {
@@ -158,11 +180,11 @@ for (const [live, reason] of [
 		const held = await client.request("work.start", { name: "crash", text: "not a retry", cwd: f.home });
 		expect(held.result).toMatchObject({ started: false, held: true, state: "awaiting_operator" });
 		const retired = await client.request("work.retire", { name: "crash" });
-		expect(retired.result.retired).toBe(live !== "indeterminate");
+		expect(retired.result.retired).toBe(true);
 		const status = await client.request("work.status", { name: "crash" });
 		expect(status.result).toMatchObject({
 			state: "awaiting_operator",
-			sessionId: live === "indeterminate" ? receipt.sessionId : "",
+			sessionId: "",
 			attempt: { endState: "terminal_uncertain" },
 		});
 		singleEffect(f, receipt.opRef, receipt.sessionId);

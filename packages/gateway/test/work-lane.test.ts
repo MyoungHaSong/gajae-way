@@ -109,7 +109,13 @@ async function fixture(
 		},
 	});
 	const notices: ChatMessagePayload[] = [];
-	const lanes = new LaneGovernor({ database: db, sessionPort: port, laneRoot: gajaewayHome, maxLanes: 2 });
+	const lanes = new LaneGovernor({
+		database: db,
+		sessionPort: port,
+		laneRoot: gajaewayHome,
+		maxLanes: 2,
+		deadConfirmMs: 0,
+	});
 	let implicitOwner: OriginRef | undefined;
 	const ownerTarget = options.ownerTarget ?? (() => implicitOwner);
 	let manager = new WorkLaneManager({
@@ -124,6 +130,7 @@ async function fixture(
 		serviceDirectory,
 		// Bind failures are final unless a test opts into the broker readiness wait.
 		brokerWait: { deadlineMs: 0 },
+		indeterminateGraceMs: 0,
 		...options,
 	});
 	cleanups.push(async () => {
@@ -1110,6 +1117,35 @@ test("persistently failing status without liveness proof settles instead of poll
 	expect(f.port.sends).toHaveLength(1);
 });
 
+test("an unanswered liveness probe keeps the attempt observed until indeterminateGraceMs passes", async () => {
+	let now = Date.now();
+	const f = await fixture({ pollMs: 1, now: () => now, indeterminateGraceMs: 60_000 });
+	const result = await started(f, "a", origin);
+	let queries = 0;
+	let answerOnce = false;
+	f.port.status = async (input) => {
+		queries++;
+		if (answerOnce) {
+			answerOnce = false;
+			return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
+		}
+		throw new Error("offline");
+	};
+	f.port.liveness = async () => {
+		throw new Error("offline");
+	};
+	// Eight failures hand the attempt to recovery, which keeps observing it.
+	await until(() => queries >= 12);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	// Past the grace, the next recovery pass settles it indeterminate (#262).
+	now += 60_000;
+	answerOnce = true;
+	await until(() => f.db.work.workAttemptGet(result.opRef)?.settledAt !== null);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("recovery_indeterminate");
+	expect(f.port.sends).toHaveLength(1);
+});
+
 test("live restart reattaches exact session/op without bind, resume or replay", async () => {
 	const f = await fixture();
 	const result = await started(f);
@@ -1674,12 +1710,21 @@ test("dead restart settles uncertainty into a sticky hold, never replacement bin
 	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_dead: output_unavailable");
 });
 
+/** The dead-lane sweep acts on a verdict only when a later sweep repeats it. */
+async function confirmDead(f: { lanes: LaneGovernor }) {
+	expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+	return await f.lanes.retireAllDead();
+}
+
 test("force-retiring an open dead lane settles its runtime and permits later work", async () => {
 	const f = await fixture({ ownerTarget: () => origin });
 	const result = await started(f, "a", origin);
 	f.port.setSessionState(result.sessionId, { live: false });
 
-	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	expect(await confirmDead(f)).toEqual({ count: 1, names: ["a"] });
+	// The unattended sweep keeps the session so the same name resumes it.
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))?.sessionId).toBe(result.sessionId);
 	const runtime = f.db.work.workAttemptGet(result.opRef);
 	const attempt = f.job().attempts[0];
 	expect(runtime).toBeDefined();
@@ -1691,7 +1736,30 @@ test("force-retiring an open dead lane settles its runtime and permits later wor
 
 	const next = await f.manager.start({ name: "a", text: "again", cwd: f.directory, resume: true });
 	expect(next.started).toBe(true);
+	// The kept binding is bound again (SessionPort.bind resumes a not-live saved session).
+	await until(() => f.port.sends.length === 2);
+	expect(f.port.sends[1]?.sessionId).toBe(result.sessionId);
 	await expect(f.manager.recover()).resolves.toBeUndefined();
+});
+
+test("the dead-lane sweep ignores a lone dead verdict, unanswered probes, and recent host activity", async () => {
+	const f = await fixture({ ownerTarget: () => origin });
+	const result = await started(f, "a", origin);
+	const sweep = async (live: boolean | undefined) => {
+		f.port.setSessionState(result.sessionId, { live });
+		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+	};
+	await sweep(false);
+	await sweep(true); // a live answer resets the streak
+	await sweep(false);
+	await sweep(undefined); // an unanswered probe is not a second verdict
+	f.port.setActivity(result.sessionId, "tool");
+	await sweep(false); // recent host activity contradicts the verdict and resets it
+	f.port.setActivity(result.sessionId, "tool", Date.now() - 600_000);
+	await sweep(false);
+	expect(f.db.work.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.port.closes).toHaveLength(0);
 });
 
 test("force retirement releases a pending work.run waiter promptly", async () => {
@@ -1735,7 +1803,7 @@ test("force-retiring a disowned lane records a session_disowned terminal", async
 	const result = await started(f);
 	f.port.liveness = async () => ({ live: undefined, disowned: true });
 
-	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	expect(await confirmDead(f)).toEqual({ count: 1, names: ["a"] });
 	const runtime = f.db.work.workAttemptGet(result.opRef);
 	const attempt = f.job().attempts[0];
 	expect(runtime?.settledAt).toBe(attempt?.endedAt);
@@ -6625,7 +6693,7 @@ test("#481 force-retiring a dead red-check retry clears its old checks cycle", a
 	await pollUntil(f, () => f.port.sends.length === 2);
 	expect(f.job().awaitingChecks?.retries).toBe(1);
 	f.port.setSessionState(sessionId, { live: false });
-	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	expect(await confirmDead(f)).toEqual({ count: 1, names: ["a"] });
 	expect(f.job().state).toBe("attempt_ended");
 	expect(f.job().awaitingChecks).toBeUndefined();
 	expect(checksNotice(f, "[lane a] completed")).toBeUndefined();
@@ -6705,9 +6773,10 @@ for (const retirement of ["automatic", "force"] as const) {
 			return close(input);
 		};
 		f.port.setSessionState(sessionId, { live: false });
-		if (retirement === "automatic") expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+		if (retirement === "automatic") expect(await confirmDead(f)).toEqual({ count: 1, names: ["a"] });
 		else expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: true, forced: true });
-		expect(admittedBeforeClose).toBe(true);
+		// The unattended sweep settles the cycle but keeps the session for resume.
+		expect(admittedBeforeClose).toBe(retirement === "force");
 		expect(f.db.work.workAttemptGet(opRef)).toEqual(savedRuntime);
 		const rows = f.db.outbox.rows();
 		expect(rows).toHaveLength(2);
@@ -6717,7 +6786,7 @@ for (const retirement of ["automatic", "force"] as const) {
 		expect(f.notices[1]?.deliveryId).not.toBe(savedRuntime.deliveryId);
 		expect(f.notices[1]?.text).toContain("awaiting_checks lane force-retired before checks settled");
 		expect(f.notices[1]?.text).toContain(`head=${head.slice(0, 12)} pr=598`);
-		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false });
+		expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: retirement === "automatic" });
 		await f.manager.recover();
 		await f.restart();
 		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });

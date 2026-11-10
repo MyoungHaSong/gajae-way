@@ -64,8 +64,11 @@ import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./br
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
+	DeadVerdictStreaks,
+	DEFAULT_DEAD_LANE_CONFIRM_MS,
 	type LaneForceRetireReason,
 	type LaneGovernor,
+	laneHostVerdict,
 	laneJobIdentity,
 	managedLaneBranchName,
 	managedLaneRepositoryPath,
@@ -115,6 +118,12 @@ const ACTIVITY_TOUCH_MS = 1_000;
 const HOST_LOST_GRACE_MS = 30_000;
 /** Conversation platforms a lane report can be admitted into as an internal turn. */
 const PERSONA_PARENT_PLATFORMS: readonly string[] = ["discord", "slack", "telegram", "loopback"];
+/**
+ * An overloaded broker (or our own saturated CLI pool) leaves inspect
+ * unanswered for minutes; settling on the first such recovery pass ended live
+ * lanes mid-work. Ten minutes outlasts the overload storms seen in production.
+ */
+const INDETERMINATE_GRACE_MS = 10 * 60_000;
 /** Re-steers on red PR checks before the lane settles failed (#481). */
 const AWAITING_CHECKS_RETRY_LIMIT = 2;
 /** How long a lane may wait in awaiting_checks before it settles with a timeout. */
@@ -220,6 +229,10 @@ export interface WorkLaneManagerOptions {
 	readonly waitTimeoutMs?: number;
 	/** How long consecutive host-gone verdicts must persist before a live observer settles `host_lost`. */
 	readonly hostLostGraceMs?: number;
+	/** How long recovery keeps observing an attempt whose liveness probe goes unanswered before `recovery_indeterminate`. */
+	readonly indeterminateGraceMs?: number;
+	/** How long recovery's dead/disowned verdict on a still-bound attempt must repeat before it settles; default DEFAULT_DEAD_LANE_CONFIRM_MS. */
+	readonly deadConfirmMs?: number;
 	readonly now?: () => number;
 	readonly checkStatusClient?: CheckStatusClient;
 	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
@@ -304,6 +317,10 @@ export class WorkLaneManager {
 	readonly #observerDisposals = new Set<Promise<void>>();
 	/** Consecutive reconciliation failures per open attempt; cleared by a successful tick or settlement. */
 	readonly #failures = new Map<string, { failures: number; reason: string }>();
+	/** First unanswered recovery liveness probe per open attempt. */
+	readonly #indeterminateSince = new Map<string, number>();
+	/** Recovery's dead/disowned verdicts per open attempt. */
+	readonly #recoveryDeadStreaks: DeadVerdictStreaks;
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
 	readonly #runCalls = new Map<string, RunCall>();
@@ -324,6 +341,7 @@ export class WorkLaneManager {
 		this.#options = options;
 		this.#db = options.database;
 		this.#port = options.port;
+		this.#recoveryDeadStreaks = new DeadVerdictStreaks(options.deadConfirmMs ?? DEFAULT_DEAD_LANE_CONFIRM_MS);
 		options.lanes.setRecoveryGate(() => this.recover());
 		options.lanes.setForceRetireSettlement((name, opRef, reason, endedAt) =>
 			this.settleForceRetiredAttempt(name, opRef, reason, endedAt),
@@ -341,6 +359,13 @@ export class WorkLaneManager {
 	}
 	#live(): void {
 		if (this.#stopped) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
+	}
+	/** When the gateway last saw session content on this exact binding, if ever. */
+	#laneActivityAt(sessionKey: string, sessionId: string): string | null {
+		return (
+			this.#db.bindings.workLaneRows().find((row) => row.origin_key === sessionKey && row.gjc_session_id === sessionId)
+				?.last_activity_at ?? null
+		);
 	}
 	#binding(runtime: WorkAttemptRuntime): boolean {
 		const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
@@ -1454,6 +1479,8 @@ export class WorkLaneManager {
 					if (this.#db.work.workAttemptGet(opRef)?.settledAt !== null) {
 						this.#observers.delete(opRef);
 						this.#failures.delete(opRef);
+						this.#indeterminateSince.delete(opRef);
+						this.#recoveryDeadStreaks.delete(opRef);
 						return;
 					}
 					// The lane was rebound under this observer: it can never write again,
@@ -2834,7 +2861,36 @@ export class WorkLaneManager {
 					/* Indeterminate authority is not a replay permit. */
 				}
 				if (!this.#current(observer)) continue;
-				if (live.live === true && !live.disowned && this.#binding(runtime)) {
+				// One probe is never a verdict on a still-bound attempt. A dead/disowned
+				// answer (an overloaded broker says `live: false` or `endpoint_stale` for
+				// working hosts) must repeat across the dead-confirm window without
+				// contradicting activity; meanwhile the attempt stays open and observed,
+				// where the observer's own continuous host-lost grace also applies. An
+				// unanswered probe is no death evidence at all: it only bounds how long
+				// recovery waits before `recovery_indeterminate` (#262 forbids polling forever).
+				const bound = this.#binding(runtime);
+				const now = this.#now();
+				const verdict = laneHostVerdict(live, now, this.#laneActivityAt(runtime.sessionKey, runtime.sessionId));
+				const death = this.#recoveryDeadStreaks.record(runtime.opRef, verdict, now);
+				if (verdict === "indeterminate")
+					this.#indeterminateSince.set(runtime.opRef, this.#indeterminateSince.get(runtime.opRef) ?? now);
+				else this.#indeterminateSince.delete(runtime.opRef);
+				const indeterminateFor = now - (this.#indeterminateSince.get(runtime.opRef) ?? now);
+				if (
+					bound &&
+					(verdict === "live" ||
+						(verdict === "dead" && !death.confirmed) ||
+						(verdict === "indeterminate" &&
+							indeterminateFor < (this.#options.indeterminateGraceMs ?? INDETERMINATE_GRACE_MS)))
+				) {
+					if (verdict === "indeterminate")
+						console.error(
+							`work_recovery_indeterminate_hold opRef=${runtime.opRef} session=${runtime.sessionId} forMs=${indeterminateFor}`,
+						);
+					else if (verdict === "dead" && death.first)
+						console.error(
+							`work_recovery_dead_suspected opRef=${runtime.opRef} session=${runtime.sessionId} live=${live.live ?? "unknown"} disowned=${live.disowned}`,
+						);
 					this.#attach(observer);
 					this.#schedule(observer, 0);
 					continue;

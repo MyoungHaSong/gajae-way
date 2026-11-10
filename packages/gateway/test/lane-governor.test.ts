@@ -983,6 +983,7 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 	const governor = new LaneGovernor({
 		database,
 		sessionPort: port,
+		deadConfirmMs: 0,
 		now: () => NOW,
 		log: (line) => logs.push(line),
 	});
@@ -992,6 +993,9 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 	port.setSessionState("sess-dead2", { live: false });
 	port.setSessionState("sess-live", { live: true });
 
+	// One verdict only nominates; the next sweep confirms.
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	expect(port.closes).toHaveLength(0);
 	const result = await governor.retireAllDead();
 	expect(result.count).toBe(2); // Only the two dead lanes
 	expect(result.names.sort()).toEqual(["dead1", "dead2"]);
@@ -1003,4 +1007,33 @@ test("#360: retireAllDead retires only dead lanes, skipping live and quarantined
 
 	expect(port.closes.length).toBe(2);
 	expect(port.closes.map((c) => c.sessionId).sort()).toEqual(["sess-dead1", "sess-dead2"]);
+});
+
+test("retireAllDead acts only after the dead verdict persists for deadConfirmMs", async () => {
+	database = await Store.open(":memory:");
+	bind("dead", NOW - 120_000, "sess-dead");
+	const port = new ScriptedSessionPort();
+	let clock = NOW;
+	const logs: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		deadConfirmMs: 180_000,
+		now: () => clock,
+		log: (line) => logs.push(line),
+	});
+	port.setSessionState("sess-dead", { live: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	expect(logs.filter((line) => line.startsWith("lane_dead_suspected name=dead"))).toHaveLength(1);
+	clock += 179_999;
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	// A live answer in between restarts the window.
+	port.setSessionState("sess-dead", { live: true });
+	clock += 1;
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	port.setSessionState("sess-dead", { live: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	clock += 180_000;
+	expect(await governor.retireAllDead()).toEqual({ count: 1, names: ["dead"] });
+	expect(port.closes.map((close) => close.sessionId)).toEqual(["sess-dead"]);
 });

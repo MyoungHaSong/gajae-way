@@ -7,7 +7,7 @@ import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
-import type { SessionPort } from "./session-port";
+import type { SessionLiveness, SessionPort } from "./session-port";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -21,6 +21,74 @@ const TERMINAL_JOB_STATES = new Set(["done", "aborted"]);
  * such a lane needs runtime evidence; only `completed` is broker-proven.
  */
 const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "terminal_missing_receipt", "failed"]);
+/**
+ * How long a dead/disowned verdict must persist, across at least two probes,
+ * before unattended reconciliation acts on it. An overloaded broker answers
+ * inspect with `live: false` or `endpoint_stale` for hosts that are still
+ * working, and one such answer used to end the lane on the spot.
+ */
+export const DEFAULT_DEAD_LANE_CONFIRM_MS = 3 * 60_000;
+/** Host or gateway-observed session activity this recent contradicts a dead verdict. */
+export const DEAD_LANE_RECENT_ACTIVITY_MS = 2 * 60_000;
+
+/**
+ * One liveness probe of a lane host read as evidence. `dead` (not live, or
+ * disowned such as `endpoint_stale`) is only a suspicion until it repeats (see
+ * {@link DeadVerdictStreaks}); activity the inspect reply or the gateway itself
+ * saw within DEAD_LANE_RECENT_ACTIVITY_MS contradicts it. An unanswered probe
+ * (timeout, broker unavailable, no `live` field) is `indeterminate`, never dead.
+ */
+export function laneHostVerdict(
+	liveness: SessionLiveness,
+	now: number,
+	lastActivityAt?: string | null,
+): "live" | "dead" | "indeterminate" {
+	if (liveness.live !== false && !liveness.disowned) return liveness.live === true ? "live" : "indeterminate";
+	const observed = lastActivityAt ? Date.parse(lastActivityAt) : Number.NaN;
+	const latest = Math.max(
+		liveness.activity?.at ?? Number.NEGATIVE_INFINITY,
+		Number.isFinite(observed) ? observed : Number.NEGATIVE_INFINITY,
+	);
+	return now - latest < DEAD_LANE_RECENT_ACTIVITY_MS ? "live" : "dead";
+}
+
+/**
+ * Repeated-death bookkeeping shared by the dead-lane sweep and work recovery.
+ * A key is confirmed dead only after `dead` verdicts on at least two probes
+ * spanning `confirmMs`. A `live` verdict clears the streak; an `indeterminate`
+ * one leaves it untouched, so silence neither confirms nor forgives.
+ */
+export class DeadVerdictStreaks {
+	readonly #streaks = new Map<string, { readonly since: number; readonly count: number }>();
+
+	constructor(readonly confirmMs: number) {
+		if (!Number.isSafeInteger(confirmMs) || confirmMs < 0)
+			throw new Error(`deadConfirmMs must be a non-negative integer, got ${confirmMs}`);
+	}
+
+	/** Records one verdict; `first` marks the probe that opened a streak. */
+	record(
+		key: string,
+		verdict: "live" | "dead" | "indeterminate",
+		now: number,
+	): { readonly confirmed: boolean; readonly first: boolean } {
+		if (verdict === "live") this.#streaks.delete(key);
+		if (verdict !== "dead") return { confirmed: false, first: false };
+		const prior = this.#streaks.get(key);
+		const streak = { since: prior?.since ?? now, count: (prior?.count ?? 0) + 1 };
+		this.#streaks.set(key, streak);
+		return { confirmed: streak.count >= 2 && now - streak.since >= this.confirmMs, first: !prior };
+	}
+
+	delete(key: string): void {
+		this.#streaks.delete(key);
+	}
+
+	/** Forgets every key not in `keys` (lanes rebound or retired meanwhile). */
+	retain(keys: ReadonlySet<string>): void {
+		for (const key of this.#streaks.keys()) if (!keys.has(key)) this.#streaks.delete(key);
+	}
+}
 
 /**
  * Durable identity of one work lane job. The jobId is INJECTIVE: each
@@ -108,6 +176,8 @@ export interface LaneGovernorOptions {
 	readonly laneRoot?: string;
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	/** See DEFAULT_DEAD_LANE_CONFIRM_MS; 0 still requires two sweeps. */
+	readonly deadConfirmMs?: number;
 	readonly now?: () => number;
 	readonly log?: (line: string, level?: LogLevel) => void;
 }
@@ -128,6 +198,8 @@ export class LaneGovernor {
 	readonly maxLanes: number;
 	readonly idleRetireMs: number;
 	readonly #now: () => number;
+	/** Dead verdicts per session id, across retireAllDead sweeps. */
+	readonly #deadStreaks: DeadVerdictStreaks;
 	readonly #log: (line: string, level?: LogLevel) => void;
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
@@ -140,6 +212,7 @@ export class LaneGovernor {
 		this.#laneRoot = options.laneRoot === undefined ? undefined : resolve(options.laneRoot);
 		this.maxLanes = positiveInteger(options.maxLanes, DEFAULT_WORK_MAX_LANES, "maxLanes");
 		this.idleRetireMs = positiveInteger(options.idleRetireMs, DEFAULT_WORK_IDLE_RETIRE_MS, "idleRetireMs");
+		this.#deadStreaks = new DeadVerdictStreaks(options.deadConfirmMs ?? DEFAULT_DEAD_LANE_CONFIRM_MS);
 		this.#now = options.now ?? (() => Date.now());
 		this.#log = options.log ?? ((line, level) => console[level ?? "info"](line));
 	}
@@ -450,12 +523,16 @@ export class LaneGovernor {
 			});
 		if (this.#stopped)
 			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "gateway is stopping" });
+		return this.#forceRetireTask(name);
+	}
+
+	#forceRetireTask(name: string, unattended?: { readonly sessionId: string }): Promise<LaneRetireOutcome> {
 		const task = (async () => {
 			try {
 				await this.#recoveryGate?.();
 				if (this.#stopped)
 					return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
-				return await this.#forceRetire(name);
+				return await this.#forceRetire(name, unattended);
 			} catch (error) {
 				const detail = sanitizeDiagnostic(diagnostic(error));
 				this.#log(`lane_force_retire_failed name=${name} reason=${detail}`);
@@ -470,7 +547,15 @@ export class LaneGovernor {
 		return task;
 	}
 
-	#forceRetire(name: string): Promise<LaneRetireOutcome> {
+	/**
+	 * `unattended` is the dead-lane sweep: it acts only on the session it
+	 * confirmed, re-checks the verdict against recent host activity, and settles
+	 * the open attempt WITHOUT closing the session or rotating the epoch. The
+	 * binding stays, so the next start of the same name resumes the saved
+	 * transcript instead of re-reading everything in a cold session; the settled
+	 * lane is then reclaimed by admission or the idle sweep like any other.
+	 */
+	#forceRetire(name: string, unattended?: { readonly sessionId: string }): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
@@ -484,6 +569,8 @@ export class LaneGovernor {
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes().find((candidate) => candidate.name === name);
 			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
+			if (unattended && lane.sessionId !== unattended.sessionId)
+				return { retired: false, sessionKey, reason: "lane was rebound since the dead verdict" };
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;
 			let repo = record?.lane.worktreePath;
@@ -499,7 +586,15 @@ export class LaneGovernor {
 			}
 			// For force retire, we must have broker liveness proof that the session is dead or disowned.
 			const liveness = await this.#safeLiveness(lane.sessionId, repo);
-			if (liveness.live !== false && !liveness.disowned) {
+			// The confirming sweep already saw a repeated dead verdict; this locked
+			// re-probe may only veto it. Silence keeps the streak for the next sweep.
+			const verdict = unattended ? laneHostVerdict(liveness, this.#now(), lane.lastActivityAt) : undefined;
+			if (verdict === "indeterminate") {
+				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=liveness_indeterminate`);
+				return { retired: false, sessionKey, reason: "session liveness is indeterminate" };
+			}
+			if (verdict === "live") this.#deadStreaks.delete(lane.sessionId);
+			if (verdict ? verdict !== "dead" : liveness.live !== false && !liveness.disowned) {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=session_still_live`);
 				return {
 					retired: false,
@@ -512,14 +607,24 @@ export class LaneGovernor {
 			// completed attempt may also own an unresolved checks cycle that must end
 			// when its lane is force-retired.
 			const lastAttempt = record?.attempts.at(-1);
+			const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
 			if (lastAttempt && (!lastAttempt.endedAt || record?.state === "awaiting_checks")) {
-				const reason: LaneForceRetireReason = liveness.disowned ? "session_disowned" : "session_dead";
 				const endedAt = new Date(this.#now()).toISOString();
 				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, reason, endedAt)) {
 					const detail = "work attempt could not be settled";
 					this.#log(`lane_force_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
 					return { retired: false, sessionKey, reason: detail };
 				}
+			} else if (unattended && record) {
+				return { retired: false, sessionKey, reason: "attempt already settled" };
+			}
+			if (unattended && record) {
+				this.#deadStreaks.delete(lane.sessionId);
+				this.#log(
+					`lane_attempt_settled_dead name=${name} session=${lane.sessionId} reason=${reason} binding=kept`,
+					"warn",
+				);
+				return { retired: true, sessionKey, sessionId: lane.sessionId, closed: false, forced: true };
 			}
 			// Forced retirement is unattended; preserve the durable worktree and
 			// branch so its commits and the stored worktree path remain resumable.
@@ -540,16 +645,30 @@ export class LaneGovernor {
 	}
 
 	/**
-	 * Retire all lanes whose sessions are provably dead or disowned.
-	 * Returns count and names of lanes successfully retired.
+	 * Unattended dead-lane reconciliation. A lane is acted on only after its
+	 * dead/disowned verdict held on at least two sweeps spanning `deadConfirmMs`,
+	 * with no recent host activity; a live answer resets the streak and an
+	 * unanswered probe leaves it as is. A lane with an open attempt (or an
+	 * unresolved checks cycle) has the attempt settled and keeps its session for
+	 * resume; a settled lane is left to admission and the idle sweep; only an
+	 * orphan binding without a job record is closed and rebound.
+	 * Returns count and names of lanes acted on.
 	 */
 	async retireAllDead(now = this.#now()): Promise<{ count: number; names: string[] }> {
 		if (this.#stopped) return { count: 0, names: [] };
 		const retired: string[] = [];
-		for (const lane of this.activeLanes(now)) {
+		const lanes = this.activeLanes(now);
+		this.#deadStreaks.retain(new Set(lanes.map((lane) => lane.sessionId)));
+		for (const lane of lanes) {
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
 			const job = this.#job(lane.name);
 			const record = job === "corrupt" ? undefined : job;
+			// A settled lane with a job record is reclaimed by admission or the idle
+			// sweep; closing it here would only cost its resumable transcript.
+			if (record && !lane.attemptOpen && record.state !== "awaiting_checks") {
+				this.#deadStreaks.delete(lane.sessionId);
+				continue;
+			}
 			let repo = record?.lane.worktreePath;
 			if (!repo) {
 				repo = this.#database.bindings.workLaneRepoBySessionId(lane.sessionId);
@@ -561,9 +680,18 @@ export class LaneGovernor {
 				repo = process.cwd();
 			}
 			const liveness = await this.#safeLiveness(lane.sessionId, repo);
-			if (liveness.live !== false && !liveness.disowned) continue; // Session is still live
+			const streak = this.#deadStreaks.record(lane.sessionId, laneHostVerdict(liveness, now, lane.lastActivityAt), now);
+			if (!streak.confirmed) {
+				if (streak.first)
+					this.#log(
+						`lane_dead_suspected name=${lane.name} session=${lane.sessionId} live=${liveness.live ?? "unknown"} disowned=${liveness.disowned}`,
+					);
+				continue;
+			}
 			try {
-				const outcome = await this.forceRetire(lane.name);
+				const outcome = record
+					? await this.#forceRetireTask(lane.name, { sessionId: lane.sessionId })
+					: await this.forceRetire(lane.name);
 				if (outcome.retired) retired.push(lane.name);
 			} catch (error) {
 				const detail = sanitizeDiagnostic(diagnostic(error));

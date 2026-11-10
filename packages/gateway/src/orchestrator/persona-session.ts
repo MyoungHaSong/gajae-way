@@ -55,6 +55,8 @@ export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 const PERSONA_SHUTDOWN_DRAIN_MS = 15_000;
 /** Maximum silence after a tail stall before a still-nonterminal operation is cut off. */
 export const STALLED_TURN_TERMINAL_TIMEOUT_MS = 10 * 60_000;
+/** Time since send after which a retired-epoch turn whose state stays unknown is closed. */
+export const STALE_RETIRED_HOLD_MS = 30 * 60_000;
 /**
  * How many times a turn may replace its session after the Router disowns it.
  * Each attempt binds a NEW session (bootstrapped with the last 24h of channel
@@ -645,6 +647,8 @@ export interface PersonaSessionManagerOptions {
 	readonly busyStallMs?: number;
 	/** Unknown-state turn on a dead host holds its origin at most this long; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS (#686). */
 	readonly unresolvedHoldMs?: number;
+	/** A retired-epoch turn whose state stays unknown this long after its send is closed; default STALE_RETIRED_HOLD_MS. */
+	readonly staleRetiredHoldMs?: number;
 	/** Called when a reverse request from the SDK host arrives. */
 	readonly onReverseRequest?: (input: {
 		originKey: string;
@@ -708,6 +712,7 @@ export class PersonaSessionManager {
 	#hostIdleRetireMs: number;
 	#busyStallMs: number;
 	#unresolvedHoldMs: number;
+	readonly staleRetiredHoldMs: number;
 	#draining = false;
 	#restartDrainId: string | undefined;
 	#stopped = false;
@@ -748,6 +753,7 @@ export class PersonaSessionManager {
 			DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS,
 			"unresolvedHoldMs",
 		);
+		this.staleRetiredHoldMs = positiveInteger(options.staleRetiredHoldMs, STALE_RETIRED_HOLD_MS, "staleRetiredHoldMs");
 		this.#log = options.log ?? ((line: string, level?: LogLevel) => console[level ?? "info"](line));
 		this.#onSloEvent = options.onSloEvent;
 		this.#onBindFailure = options.onBindFailure;
@@ -1730,17 +1736,7 @@ class OriginActor {
 		if (retiredEpoch && bound) return false;
 		const database = this.#manager.database;
 		if (database.core.metaGet(escalatedHoldKey(turn.opRef)) !== undefined) return false;
-		// The hold starts at the send. A row stamped by the schema 39 backfill
-		// ('pre-migration-39') or bound before dispatch was recorded falls back to
-		// its bind and then its arrival, so an old stranded row is still bounded (#705).
-		const sinceMs = [
-			database.inbox.sendAttemptedAt(turn.opRef),
-			database.inbox.turnDispatchedAt(turn.opRef),
-			database.inbox.turnRow(turn.opRef)?.received_at,
-		]
-			// Only an ISO timestamp counts: Date.parse reads the marker as the year 2039.
-			.map((at) => (typeof at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(at) ? Date.parse(at) : Number.NaN))
-			.find((ms) => Number.isFinite(ms));
+		const sinceMs = this.#holdSinceMs(turn.opRef);
 		if (sinceMs === undefined) return false;
 		const heldMs = this.#manager.now() - sinceMs;
 		if (heldMs < this.#manager.unresolvedHoldMs) return false;
@@ -1832,6 +1828,58 @@ class OriginActor {
 	}
 
 	/**
+	 * A turn of an epoch that was already rotated away (by `/new`, a restart or the
+	 * escalation above) no longer gates its origin, but while its operation state
+	 * stays unknown every recovery sweep keeps probing it (inspect, status,
+	 * inspect, liveness each minute) and its retired hold keeps the restart drain
+	 * from finishing, forever: escalation needs a provably dead host and runs once.
+	 * Past `staleRetiredHoldMs` since its send it is closed as retired, whatever
+	 * the host answers, and never resent; newer messages already continue on the
+	 * fresh epoch. A result arriving after that is not delivered.
+	 */
+	async #closeStaleRetiredHold(turn: InboundTurn, bound: BoundTurn | undefined): Promise<boolean> {
+		if (this.#stopped || this.#manager.stopped || turn.epoch >= this.#epoch()) return false;
+		const database = this.#manager.database;
+		const sinceMs = this.#holdSinceMs(turn.opRef);
+		if (sinceMs === undefined) return false;
+		const heldMs = this.#manager.now() - sinceMs;
+		if (heldMs < this.#manager.staleRetiredHoldMs) return false;
+		const open = database.inbox.turnRow(turn.opRef);
+		if (!open || open.state !== "pending") return false;
+		const changed = database.transaction((tx) => completeInboundTurn(database, tx, turn.opRef, "retired"));
+		if (changed === 1)
+			for (const held of database.inbox.steersHeld(turn.opRef)) await this.#abandonHeldSteer(held, turn.opRef, bound);
+		this.#manager.log(
+			`retired_turn_closed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=stale_retired_hold heldMs=${heldMs}`,
+			"warn",
+		);
+		this.#recoveryHoldReasons.delete(turn.opRef);
+		if (bound) await this.#forgetClosed(bound);
+		else this.#holdSweeps.delete(turn.opRef);
+		return true;
+	}
+
+	/**
+	 * When an unresolved hold started: at the send. A row stamped by the schema 39
+	 * backfill ('pre-migration-39') or bound before dispatch was recorded falls
+	 * back to its bind and then its arrival, so an old stranded row is still
+	 * bounded (#705).
+	 */
+	#holdSinceMs(opRef: string): number | undefined {
+		const database = this.#manager.database;
+		return (
+			[
+				database.inbox.sendAttemptedAt(opRef),
+				database.inbox.turnDispatchedAt(opRef),
+				database.inbox.turnRow(opRef)?.received_at,
+			]
+				// Only an ISO timestamp counts: Date.parse reads the marker as the year 2039.
+				.map((at) => (typeof at === "string" && /^\d{4}-\d{2}-\d{2}T/.test(at) ? Date.parse(at) : Number.NaN))
+				.find((ms) => Number.isFinite(ms))
+		);
+	}
+
+	/**
 	 * Posts every escalation notice whose intent is durable but not yet handed to
 	 * the delivery ledger. Delivery ids are deterministic per trigger, so a notice
 	 * replayed after a crash or a failed hook is posted once.
@@ -1903,6 +1951,7 @@ class OriginActor {
 			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown") {
 			if (await this.#escalateUnresolvedHold(turn, undefined)) return;
+			if (await this.#closeStaleRetiredHold(turn, undefined)) return;
 			this.#logRecoveryHoldOnce(turn, "operation_state_unknown");
 			return;
 		}
@@ -1998,6 +2047,7 @@ class OriginActor {
 			case "operator_hold": {
 				// Unknown status and an empty queue do not authenticate non-admission.
 				if (status.status.status === "unknown" && (await this.#escalateUnresolvedHold(turn, undefined))) return;
+				if (status.status.status === "unknown" && (await this.#closeStaleRetiredHold(turn, undefined))) return;
 				this.#logRecoveryHoldOnce(turn, decision.reason);
 				return;
 			}
@@ -4046,6 +4096,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			if (await this.#closeStaleRetiredHold(bound.turn, bound)) return;
 			this.#logRecoveryHoldOnce(bound.turn, "status_unavailable", `detail=${safeDiagnostic(error)}`);
 			// A turn no relay will announce the end of must not wait for the 60 s
 			// sweep after one unreadable status: keep rechecking at the bounded cadence.
@@ -4072,6 +4123,7 @@ class OriginActor {
 				await this.#dispatchNext();
 				return;
 			}
+			if (await this.#closeStaleRetiredHold(bound.turn, bound)) return;
 			this.#logRecoveryHoldOnce(bound.turn, "operation_state_unknown", `sweeps=${count}`);
 			if (bound.tailEvidenceUnavailable || bound.statusRecheckAfterStall) this.#scheduleStatusRecheck(bound);
 			return;
