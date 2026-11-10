@@ -1180,6 +1180,71 @@ test("live unknown restart observes without replay or false acceptance", async (
 	expect(f.port.resumes).toHaveLength(0);
 });
 
+test("restart recovery keeps an attempt whose one dead inspect is followed by a live one", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, deadConfirmMs: 180_000 });
+	const result = await started(f);
+	f.port.setSessionState(result.sessionId, { live: false });
+	await f.restart();
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	f.port.setSessionState(result.sessionId, { live: true });
+	for (let minute = 0; minute < 5; minute++) {
+		now += 60_000;
+		await f.manager.recover();
+	}
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	// The same operation finishes on the same session: nothing was replayed or rebound.
+	f.port.complete(result.opRef, "same worker answer");
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.job().attempts[0]?.endState).toBe("completed");
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.closes).toHaveLength(0);
+});
+
+test("restart recovery never records an unanswered liveness probe as death", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, deadConfirmMs: 0, indeterminateGraceMs: 24 * 60 * 60_000 });
+	const result = await started(f);
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	f.port.liveness = async () => ({ live: undefined, disowned: false });
+	await f.restart();
+	for (let hour = 0; hour < 6; hour++) {
+		now += 60 * 60_000;
+		await f.manager.recover();
+		await f.lanes.retireAllDead(now);
+	}
+	await Bun.sleep(20);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))?.sessionId).toBe(result.sessionId);
+});
+
+test("restart recovery settles session_dead only when dead answers repeat across deadConfirmMs, keeping the session", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, deadConfirmMs: 180_000 });
+	const result = await started(f);
+	f.port.setSessionState(result.sessionId, { live: false });
+	await f.restart();
+	now += 60_000;
+	await f.manager.recover();
+	// Two dead answers, but only a minute apart.
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	now += 120_000;
+	await f.manager.recover();
+	await until(() => f.db.work.workAttemptOpen().length === 0);
+	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_dead");
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.db.bindings.getSessionRecord(workSessionKey("a"))?.sessionId).toBe(result.sessionId);
+	expect(f.port.sends).toHaveLength(1);
+});
+
 /** Real owned prompt journal and relay; no SDK process or host is launched. */
 async function interruptedBusyWorkFixture() {
 	const f = await fixture();

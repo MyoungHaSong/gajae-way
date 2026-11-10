@@ -1037,3 +1037,90 @@ test("retireAllDead acts only after the dead verdict persists for deadConfirmMs"
 	expect(await governor.retireAllDead()).toEqual({ count: 1, names: ["dead"] });
 	expect(port.closes.map((close) => close.sessionId)).toEqual(["sess-dead"]);
 });
+
+/** An open-attempt lane whose dead-lane settlements are recorded, not executed. */
+async function openLaneGovernor(clock: { now: number }) {
+	database = await Store.open(":memory:");
+	bind("busy", NOW - 600_000, SESSION_ID);
+	persistJob("busy", "running", true);
+	const port = new ScriptedSessionPort();
+	const logs: string[] = [];
+	const settlements: string[] = [];
+	const governor = new LaneGovernor({
+		database,
+		sessionPort: port,
+		now: () => clock.now,
+		log: (line) => logs.push(line),
+	});
+	governor.setForceRetireSettlement((name, _opRef, reason) => {
+		settlements.push(`${name}:${reason}`);
+		return true;
+	});
+	return { port, logs, settlements, governor };
+}
+
+test("retireAllDead never acts on a lane whose one dead answer is followed by a live one", async () => {
+	const clock = { now: NOW };
+	const { port, settlements, governor } = await openLaneGovernor(clock);
+	port.setSessionState(SESSION_ID, { live: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	port.setSessionState(SESSION_ID, { live: true });
+	for (let minute = 0; minute < 10; minute++) {
+		clock.now += 60_000;
+		expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	}
+	// A later lone dead answer starts a fresh window rather than confirming the old one.
+	port.setSessionState(SESSION_ID, { live: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	expect(settlements).toEqual([]);
+	expect(port.closes).toEqual([]);
+	expect(database.bindings.getSessionRecord("work/task/busy")?.sessionId).toBe(SESSION_ID);
+});
+
+test("retireAllDead never counts unanswered or timed-out probes as death, however long they last", async () => {
+	const clock = { now: NOW };
+	const { port, settlements, governor } = await openLaneGovernor(clock);
+	let probes = 0;
+	port.liveness = async () => {
+		probes++;
+		if (probes % 2 === 0) throw new Error("gjc sdk session inspect timed out after 10000ms");
+		return { live: undefined, disowned: false };
+	};
+	for (let minute = 0; minute < 120; minute++) {
+		clock.now += 60_000;
+		expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	}
+	expect(probes).toBe(120);
+	expect(settlements).toEqual([]);
+	expect(port.closes).toEqual([]);
+});
+
+test("retireAllDead settles a lane only on dead evidence repeated past the window, and keeps its session", async () => {
+	const clock = { now: NOW };
+	const { port, logs, settlements, governor } = await openLaneGovernor(clock);
+	port.setSessionState(SESSION_ID, { live: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	// Silence in between neither confirms nor forgives the suspicion.
+	port.liveness = async () => ({ live: undefined, disowned: false });
+	clock.now += 60 * 60_000;
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	expect(settlements).toEqual([]);
+	// Inspect reports host activity a minute ago: that contradicts the verdict.
+	port.liveness = async () => ({ live: false, disowned: false, activity: { state: "tool", at: clock.now - 60_000 } });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	// The streak restarted: dead answers must again span the window.
+	port.liveness = async () => ({ live: false, disowned: false });
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	clock.now += 179_999;
+	expect(await governor.retireAllDead()).toEqual({ count: 0, names: [] });
+	expect(settlements).toEqual([]);
+	clock.now += 1;
+	expect(await governor.retireAllDead()).toEqual({ count: 1, names: ["busy"] });
+	expect(settlements).toEqual(["busy:session_dead"]);
+	// A possibly mistaken verdict never closes the session: a same-name start resumes it.
+	expect(port.closes).toEqual([]);
+	expect(database.bindings.getSessionRecord("work/task/busy")?.sessionId).toBe(SESSION_ID);
+	expect(
+		logs.some((line) => line.startsWith("lane_attempt_settled_dead name=busy") && line.includes("binding=kept")),
+	).toBe(true);
+});
