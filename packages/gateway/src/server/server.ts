@@ -1179,6 +1179,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		laneRoot: options.config.home,
 		maxLanes: options.config.work?.maxLanes,
 		idleRetireMs: options.config.work?.idleRetireMs,
+		deadConfirmMs: options.config.work?.deadConfirmMs,
 	});
 	const work = new WorkLaneManager({
 		database: options.database,
@@ -1195,6 +1196,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
+		deadConfirmMs: options.config.work?.deadConfirmMs,
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {

@@ -33,10 +33,13 @@ export const DEFAULT_WORK_MAX_LANES = 4;
 export const DEFAULT_WORK_IDLE_RETIRE_MS = 6 * 60 * 60_000;
 const WORK_IDLE_RETIRE_MIN_MS = 60_000;
 const WORK_IDLE_RETIRE_MAX_MS = 7 * 24 * 60 * 60_000;
+const WORK_DEAD_CONFIRM_MAX_MS = 60 * 60_000;
 
 export interface WorkLaneConfig {
 	readonly maxLanes?: number;
 	readonly idleRetireMs?: number;
+	/** How long a lane host's dead/disowned verdict must repeat before unattended reconciliation acts on it. */
+	readonly deadConfirmMs?: number;
 	readonly allowNested?: boolean;
 }
 
@@ -591,8 +594,12 @@ function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
 
 function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
-	if (Object.keys(input).some((key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested"))
-		throw new ConfigError("config_invalid", "work may only contain maxLanes, idleRetireMs, and allowNested");
+	const keys = ["maxLanes", "idleRetireMs", "deadConfirmMs", "allowNested"];
+	if (Object.keys(input).some((key) => !keys.includes(key)))
+		throw new ConfigError(
+			"config_invalid",
+			"work may only contain maxLanes, idleRetireMs, deadConfirmMs, and allowNested",
+		);
 	if (
 		input.maxLanes !== undefined &&
 		(!Number.isInteger(input.maxLanes) || (input.maxLanes as number) < 1 || (input.maxLanes as number) > 256)
@@ -608,11 +615,22 @@ function parseWork(value: unknown): WorkLaneConfig {
 			"config_invalid",
 			`work.idleRetireMs must be an integer between ${WORK_IDLE_RETIRE_MIN_MS} and ${WORK_IDLE_RETIRE_MAX_MS}`,
 		);
+	if (
+		input.deadConfirmMs !== undefined &&
+		(!Number.isInteger(input.deadConfirmMs) ||
+			(input.deadConfirmMs as number) < 0 ||
+			(input.deadConfirmMs as number) > WORK_DEAD_CONFIRM_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`work.deadConfirmMs must be an integer between 0 and ${WORK_DEAD_CONFIRM_MAX_MS}`,
+		);
 	if (input.allowNested !== undefined && typeof input.allowNested !== "boolean")
 		throw new ConfigError("config_invalid", "work.allowNested must be a boolean");
 	return {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
+		...(input.deadConfirmMs === undefined ? {} : { deadConfirmMs: input.deadConfirmMs as number }),
 		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
 	};
 }

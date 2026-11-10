@@ -28,28 +28,20 @@ const UNPROVEN_END_STATES = new Set(["attempt_ended", "terminal_uncertain", "ter
  * working, and one such answer used to end the lane on the spot.
  */
 export const DEFAULT_DEAD_LANE_CONFIRM_MS = 3 * 60_000;
-/** Host or gateway-observed session activity this recent contradicts a dead verdict. */
+/** Host activity the inspect reply reports this recently contradicts a dead verdict. */
 export const DEAD_LANE_RECENT_ACTIVITY_MS = 2 * 60_000;
 
 /**
  * One liveness probe of a lane host read as evidence. `dead` (not live, or
  * disowned such as `endpoint_stale`) is only a suspicion until it repeats (see
- * {@link DeadVerdictStreaks}); activity the inspect reply or the gateway itself
- * saw within DEAD_LANE_RECENT_ACTIVITY_MS contradicts it. An unanswered probe
+ * {@link DeadVerdictStreaks}); host activity the same inspect reply reports
+ * within DEAD_LANE_RECENT_ACTIVITY_MS contradicts it. An unanswered probe
  * (timeout, broker unavailable, no `live` field) is `indeterminate`, never dead.
  */
-export function laneHostVerdict(
-	liveness: SessionLiveness,
-	now: number,
-	lastActivityAt?: string | null,
-): "live" | "dead" | "indeterminate" {
+export function laneHostVerdict(liveness: SessionLiveness, now: number): "live" | "dead" | "indeterminate" {
 	if (liveness.live !== false && !liveness.disowned) return liveness.live === true ? "live" : "indeterminate";
-	const observed = lastActivityAt ? Date.parse(lastActivityAt) : Number.NaN;
-	const latest = Math.max(
-		liveness.activity?.at ?? Number.NEGATIVE_INFINITY,
-		Number.isFinite(observed) ? observed : Number.NEGATIVE_INFINITY,
-	);
-	return now - latest < DEAD_LANE_RECENT_ACTIVITY_MS ? "live" : "dead";
+	const at = liveness.activity?.at;
+	return at !== undefined && now - at < DEAD_LANE_RECENT_ACTIVITY_MS ? "live" : "dead";
 }
 
 /**
@@ -66,18 +58,22 @@ export class DeadVerdictStreaks {
 			throw new Error(`deadConfirmMs must be a non-negative integer, got ${confirmMs}`);
 	}
 
-	/** Records one verdict; `first` marks the probe that opened a streak. */
+	/**
+	 * Records one verdict; `first` marks the probe that opened a streak and
+	 * `windowEndsInMs` is how long until a repeated verdict could confirm it.
+	 */
 	record(
 		key: string,
 		verdict: "live" | "dead" | "indeterminate",
 		now: number,
-	): { readonly confirmed: boolean; readonly first: boolean } {
+	): { readonly confirmed: boolean; readonly first: boolean; readonly windowEndsInMs: number } {
 		if (verdict === "live") this.#streaks.delete(key);
-		if (verdict !== "dead") return { confirmed: false, first: false };
+		if (verdict !== "dead") return { confirmed: false, first: false, windowEndsInMs: 0 };
 		const prior = this.#streaks.get(key);
 		const streak = { since: prior?.since ?? now, count: (prior?.count ?? 0) + 1 };
 		this.#streaks.set(key, streak);
-		return { confirmed: streak.count >= 2 && now - streak.since >= this.confirmMs, first: !prior };
+		const windowEndsInMs = Math.max(0, streak.since + this.confirmMs - now);
+		return { confirmed: streak.count >= 2 && windowEndsInMs === 0, first: !prior, windowEndsInMs };
 	}
 
 	delete(key: string): void {
@@ -526,7 +522,10 @@ export class LaneGovernor {
 		return this.#forceRetireTask(name);
 	}
 
-	#forceRetireTask(name: string, unattended?: { readonly sessionId: string }): Promise<LaneRetireOutcome> {
+	#forceRetireTask(
+		name: string,
+		unattended?: { readonly sessionId: string; readonly now: number },
+	): Promise<LaneRetireOutcome> {
 		const task = (async () => {
 			try {
 				await this.#recoveryGate?.();
@@ -555,7 +554,10 @@ export class LaneGovernor {
 	 * transcript instead of re-reading everything in a cold session; the settled
 	 * lane is then reclaimed by admission or the idle sweep like any other.
 	 */
-	#forceRetire(name: string, unattended?: { readonly sessionId: string }): Promise<LaneRetireOutcome> {
+	#forceRetire(
+		name: string,
+		unattended?: { readonly sessionId: string; readonly now: number },
+	): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
@@ -588,7 +590,7 @@ export class LaneGovernor {
 			const liveness = await this.#safeLiveness(lane.sessionId, repo);
 			// The confirming sweep already saw a repeated dead verdict; this locked
 			// re-probe may only veto it. Silence keeps the streak for the next sweep.
-			const verdict = unattended ? laneHostVerdict(liveness, this.#now(), lane.lastActivityAt) : undefined;
+			const verdict = unattended ? laneHostVerdict(liveness, Math.max(unattended.now, this.#now())) : undefined;
 			if (verdict === "indeterminate") {
 				this.#log(`lane_force_retire_rejected name=${name} session=${lane.sessionId} reason=liveness_indeterminate`);
 				return { retired: false, sessionKey, reason: "session liveness is indeterminate" };
@@ -680,7 +682,7 @@ export class LaneGovernor {
 				repo = process.cwd();
 			}
 			const liveness = await this.#safeLiveness(lane.sessionId, repo);
-			const streak = this.#deadStreaks.record(lane.sessionId, laneHostVerdict(liveness, now, lane.lastActivityAt), now);
+			const streak = this.#deadStreaks.record(lane.sessionId, laneHostVerdict(liveness, now), now);
 			if (!streak.confirmed) {
 				if (streak.first)
 					this.#log(
@@ -690,7 +692,7 @@ export class LaneGovernor {
 			}
 			try {
 				const outcome = record
-					? await this.#forceRetireTask(lane.name, { sessionId: lane.sessionId })
+					? await this.#forceRetireTask(lane.name, { sessionId: lane.sessionId, now })
 					: await this.forceRetire(lane.name);
 				if (outcome.retired) retired.push(lane.name);
 			} catch (error) {

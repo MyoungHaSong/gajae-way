@@ -321,6 +321,8 @@ export class WorkLaneManager {
 	readonly #indeterminateSince = new Map<string, number>();
 	/** Recovery's dead/disowned verdicts per open attempt. */
 	readonly #recoveryDeadStreaks: DeadVerdictStreaks;
+	/** One pending re-probe of suspected-dead attempts, when their confirm window closes. */
+	#deadRecheck: ReturnType<typeof setTimeout> | undefined;
 	readonly #waiters = new Map<string, Set<Waiter>>();
 	/** Exact output belongs to an interested invocation, not its observer or later waiter. */
 	readonly #runCalls = new Map<string, RunCall>();
@@ -359,13 +361,6 @@ export class WorkLaneManager {
 	}
 	#live(): void {
 		if (this.#stopped) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
-	}
-	/** When the gateway last saw session content on this exact binding, if ever. */
-	#laneActivityAt(sessionKey: string, sessionId: string): string | null {
-		return (
-			this.#db.bindings.workLaneRows().find((row) => row.origin_key === sessionKey && row.gjc_session_id === sessionId)
-				?.last_activity_at ?? null
-		);
 	}
 	#binding(runtime: WorkAttemptRuntime): boolean {
 		const binding = this.#db.bindings.getSessionRecord(runtime.sessionKey);
@@ -2864,32 +2859,39 @@ export class WorkLaneManager {
 				// One probe is never a verdict on a still-bound attempt. A dead/disowned
 				// answer (an overloaded broker says `live: false` or `endpoint_stale` for
 				// working hosts) must repeat across the dead-confirm window without
-				// contradicting activity; meanwhile the attempt stays open and observed,
-				// where the observer's own continuous host-lost grace also applies. An
-				// unanswered probe is no death evidence at all: it only bounds how long
+				// contradicting activity; until then the attempt stays open and the next
+				// recovery sweep probes it again. An unanswered probe is no death evidence
+				// at all: the attempt stays observed and silence only bounds how long
 				// recovery waits before `recovery_indeterminate` (#262 forbids polling forever).
 				const bound = this.#binding(runtime);
 				const now = this.#now();
-				const verdict = laneHostVerdict(live, now, this.#laneActivityAt(runtime.sessionKey, runtime.sessionId));
+				const verdict = laneHostVerdict(live, now);
 				const death = this.#recoveryDeadStreaks.record(runtime.opRef, verdict, now);
 				if (verdict === "indeterminate")
 					this.#indeterminateSince.set(runtime.opRef, this.#indeterminateSince.get(runtime.opRef) ?? now);
 				else this.#indeterminateSince.delete(runtime.opRef);
 				const indeterminateFor = now - (this.#indeterminateSince.get(runtime.opRef) ?? now);
+				if (bound && verdict === "dead" && !death.confirmed) {
+					if (death.first)
+						console.error(
+							`work_recovery_dead_suspected opRef=${runtime.opRef} session=${runtime.sessionId} live=${live.live ?? "unknown"} disowned=${live.disowned}`,
+						);
+					// Unregistered, so the next sweep re-reads status and liveness for it;
+					// one more sweep is due when the confirm window closes.
+					this.#observers.delete(runtime.opRef);
+					await this.#disposeObserver(observer);
+					this.#scheduleDeadRecheck(death.windowEndsInMs);
+					continue;
+				}
 				if (
 					bound &&
 					(verdict === "live" ||
-						(verdict === "dead" && !death.confirmed) ||
 						(verdict === "indeterminate" &&
 							indeterminateFor < (this.#options.indeterminateGraceMs ?? INDETERMINATE_GRACE_MS)))
 				) {
 					if (verdict === "indeterminate")
 						console.error(
 							`work_recovery_indeterminate_hold opRef=${runtime.opRef} session=${runtime.sessionId} forMs=${indeterminateFor}`,
-						);
-					else if (verdict === "dead" && death.first)
-						console.error(
-							`work_recovery_dead_suspected opRef=${runtime.opRef} session=${runtime.sessionId} live=${live.live ?? "unknown"} disowned=${live.disowned}`,
 						);
 					this.#attach(observer);
 					this.#schedule(observer, 0);
@@ -3017,9 +3019,24 @@ export class WorkLaneManager {
 		this.#observers.clear();
 	}
 
+	#scheduleDeadRecheck(delayMs: number): void {
+		if (this.#stopped || this.#deadRecheck) return;
+		this.#deadRecheck = setTimeout(() => {
+			this.#deadRecheck = undefined;
+			// A recovery pass still running already passed these attempts: wait it out.
+			void (this.#recovery ?? Promise.resolve())
+				.then(() => this.recover())
+				.catch(() => {
+					/* Recovery reports its own failures; the attempt stays open. */
+				});
+		}, delayMs);
+	}
+
 	stop(): Promise<void> {
 		if (this.#stopPromise) return this.#stopPromise;
 		this.#stopped = true;
+		if (this.#deadRecheck) clearTimeout(this.#deadRecheck);
+		this.#deadRecheck = undefined;
 		for (const call of this.#runCalls.values()) this.#releaseRunCall(call);
 		for (const set of this.#waiters.values())
 			for (const waiter of [...set]) waiter.finish(new ProtocolError("gateway_shutting_down", "gateway is stopping"));

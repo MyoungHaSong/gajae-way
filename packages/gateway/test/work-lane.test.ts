@@ -131,6 +131,7 @@ async function fixture(
 		// Bind failures are final unless a test opts into the broker readiness wait.
 		brokerWait: { deadlineMs: 0 },
 		indeterminateGraceMs: 0,
+		deadConfirmMs: 0,
 		...options,
 	});
 	cleanups.push(async () => {
@@ -162,6 +163,7 @@ async function fixture(
 				ownerTarget,
 				pollMs: 5,
 				deliverFallback: (payload) => notices.push(payload),
+				deadConfirmMs: 0,
 				...options,
 				...extra,
 			});
@@ -1696,6 +1698,9 @@ test("dead restart settles uncertainty into a sticky hold, never replacement bin
 	const result = await started(f, "a", origin);
 	f.port.setSessionState(result.sessionId, { live: false });
 	await f.restart();
+	// One dead probe only suspects the host; the next recovery sweep confirms it.
+	expect(f.db.work.workAttemptOpen()).toHaveLength(1);
+	await f.manager.recover();
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
@@ -2429,6 +2434,7 @@ test("historical open attempt recovery uses no current notification target and n
 		startedAt: new Date().toISOString(),
 	});
 	f.db.transaction((tx) => f.db.work.putLaneJob(tx, { ...job, laneKey, json: JSON.stringify(job) }));
+	await f.manager.recover();
 	await f.manager.recover();
 	await until(() => f.db.work.workAttemptGet("old-open-attempt")?.settledAt != null);
 	expect(f.db.work.workAttemptGet("old-open-attempt")).toMatchObject({
@@ -4848,6 +4854,7 @@ test("AC-K uncertain send acceptance re-prepends on the next send", async () => 
 	const first = f.job().attempts[0]!;
 	f.port.setSessionState(first.sessionId, { live: false });
 	await f.restart();
+	await f.manager.recover();
 	await until(() => f.db.work.workAttemptGet(first.opRef)?.settledAt !== null);
 	f.port.send = send;
 	const retry = await f.manager.start({ name: "a", text: "retry", cwd: f.directory, resume: true });
@@ -5593,6 +5600,7 @@ test("#308 restart recovery classifies a router-disowned open attempt as host_lo
 	};
 	f.port.setSessionState(result.sessionId, { live: false });
 	await f.restart();
+	await f.manager.recover();
 	await until(() => f.db.work.workAttemptOpen().length === 0);
 	expect(f.db.work.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("host_lost");
 	expect(f.job().state).toBe("attempt_ended");

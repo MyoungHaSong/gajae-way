@@ -315,7 +315,8 @@ async function serve(home: string, barrier?: Barrier) {
 		dbPath: join(home, "gateway.db"),
 		ownerTarget: { origin: noticeOrigin },
 		channels: { fixture: { engagement: "open" as const, audience: "all" as const } },
-		work: { maxLanes: 2, ...storedConfig.work },
+		// Dead-verdict confirmation still takes two probes, without the production minutes.
+		work: { maxLanes: 2, deadConfirmMs: 0, ...storedConfig.work },
 	};
 	const server = await startUnixServer({
 		config,
