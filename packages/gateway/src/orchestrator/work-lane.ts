@@ -64,8 +64,8 @@ import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./br
 import { readFailedTransportCause } from "./failed-turn-evidence";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
-	DeadVerdictStreaks,
 	DEFAULT_DEAD_LANE_CONFIRM_MS,
+	DeadVerdictStreaks,
 	type LaneForceRetireReason,
 	type LaneGovernor,
 	laneHostVerdict,
