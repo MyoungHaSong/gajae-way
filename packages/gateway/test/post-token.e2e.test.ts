@@ -159,6 +159,50 @@ test("[REPLY:] names a conversation only when it is one; a message id still thre
 		expect(replyTargetConversation(messageId, here, config)).toBeUndefined();
 });
 
+test("[REPLY:<parent channel id>] inside a thread means this thread, not a post to the channel root", () => {
+	const thread: OriginRef = { platform: "discord", kind: "thread", conversationId: "t-9", parentId: "chan-1" };
+	const config = { channels } as GatewayConfig;
+	// The bare parent id is the configured channel this thread lives in: the persona copied `parent-id`.
+	expect(replyTargetConversation("chan-1", thread, config)).toEqual({ ok: false, reason: "current_conversation" });
+	// Explicit channel spellings still post; another configured room still posts.
+	expect(replyTargetConversation("discord:chan-1", thread, config)).toMatchObject({ ok: true, key: HERE });
+	expect(replyTargetConversation("report-room", thread, config)).toMatchObject({ ok: true, key: REPORT });
+	// The thread's own root message id is a message id, as before.
+	expect(replyTargetConversation("t-9", thread, config)).toBeUndefined();
+	// Outside a thread the same bare id is still that channel.
+	const room: OriginRef = { platform: "discord", kind: "channel", conversationId: "report-room" };
+	expect(replyTargetConversation("chan-1", room, config)).toMatchObject({ ok: true, key: HERE });
+});
+
+test("a thread answer opening with [REPLY:<parent channel id>] is delivered in the thread with the token stripped", async () => {
+	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
+	const client = await startGateway(port);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "th1",
+		verb: "chat.send",
+		params: {
+			origin: { platform: "discord", kind: "thread", conversationId: "t-9", parentId: "chan-1" },
+			text: "진행 현황",
+			messageId: "m-th1",
+			engagement: { mentioned: true, group: true, authorId: "human-1" },
+		},
+	});
+	await eventually(() => port.sends.length >= 1, "turn was not sent");
+	port.complete(port.sends.at(-1)!.opRef, "[REPLY:chan-1]\n네, 진행 중입니다.");
+	await eventually(() => messages(client).length === 1, "the answer was not delivered");
+	await Bun.sleep(50);
+	const delivered = messages(client).map((frame) => [
+		frame.payload.origin.kind,
+		frame.payload.origin.conversationId,
+		frame.payload.text,
+		frame.payload.replyToMessageId,
+	]);
+	expect(delivered).toEqual([["thread", "t-9", "네, 진행 중입니다.", undefined]]);
+	expect(rows(HERE)).toHaveLength(0);
+});
+
 test("[SEND:]/[POST:] blocks anywhere in a reply post once each; the text around them stays here", async () => {
 	const port = new ScriptedSessionPort({ onBind: (input) => `session-${input.originKey}-${input.epoch}` });
 	const client = await startGateway(port);

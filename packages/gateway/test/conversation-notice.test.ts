@@ -13,8 +13,22 @@ test("a chat conversation notice names the reply-threading token", () => {
 	for (const origin of [slackDm, slackChannel]) {
 		const notice = currentConversationNotice(origin);
 		expect(notice).toContain("[REPLY:<message id>]");
-		expect(notice).toContain("thread's parent message id");
+		expect(notice).toContain("thread's root message id");
+		expect(notice).toContain("Never put a channel id in a reply token");
 	}
+});
+
+// Live finding (discord #대답, 2026-11-14): a thread session copied the
+// metadata `parent-id` (the channel) into [REPLY:], and the answer was posted
+// to the channel root while the thread stayed empty.
+test("a thread conversation notice says a token-less reply lands here and parent-id is never a target", () => {
+	const thread: OriginRef = { platform: "discord", kind: "thread", conversationId: "t-9", parentId: "c-1" };
+	const notice = currentConversationNotice(thread);
+	expect(notice).toContain("a reply without a reply token already lands here");
+	expect(notice).toContain(
+		"`parent-id` in the conversation metadata is the channel this thread lives in, never a reply target",
+	);
+	expect(currentConversationNotice(slackChannel)).not.toContain("This conversation is itself a thread");
 });
 
 // Owner request 2026-10-01: post a work-done line to another configured room.

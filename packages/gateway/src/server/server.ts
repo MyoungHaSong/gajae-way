@@ -4667,6 +4667,12 @@ export function resolvePostTarget(raw: string, origin: OriginRef, config: Gatewa
  * it is a message id and threads here as before. A bare id counts as a
  * conversation only when it IS one this reply could name (a configured channel
  * or this one) - otherwise it is a message id like any other.
+ *
+ * Inside a thread, the bare id of the thread's parent channel is read as this
+ * conversation, never as a post: the session context names that id as
+ * `parent-id`, and a persona that copies it into [REPLY:] means "answer in this
+ * thread", yet as a configured channel it would post the answer to the
+ * channel root and leave the thread empty (live, discord #대답, 2026-11-14).
  */
 export function replyTargetConversation(
 	raw: string,
@@ -4675,6 +4681,8 @@ export function replyTargetConversation(
 ): PostTargetResolution | undefined {
 	const spelled = spelledConversation(raw, origin, config);
 	if (!spelled) return undefined;
+	if (spelled.bare && origin.kind === "thread" && raw.trim() === origin.parentId)
+		return { ok: false, reason: "current_conversation" };
 	const resolved = resolveSpelledPost(spelled.target, origin, config);
 	if (spelled.bare && !resolved.ok && resolved.reason !== "current_conversation") return undefined;
 	return resolved;
@@ -4725,7 +4733,12 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// thread (live, slack DM, 2026-09-17).
 		...(isChatPlatform(origin.platform)
 			? [
-					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root. To say something in another channel, use a post block (below), not a reply token.",
+					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's root message id (the message the thread was started from) so your answer lands in that thread instead of the conversation root. Never put a channel id in a reply token: a channel id is a room, and the answer would be posted to that room's root. To say something in another channel, use a post block (below), not a reply token.",
+					...(origin.kind === "thread"
+						? [
+								"This conversation is itself a thread: a reply without a reply token already lands here, so omit the token unless you answer one specific message. The `parent-id` in the conversation metadata is the channel this thread lives in, never a reply target.",
+							]
+						: []),
 					`Posting to another room: wrap what that channel should read as [POST:<origin key>] the text to post [POSTDONE] (for example [POST:${origin.platform}/channel/<channel id>] ... [POSTDONE]); [SEND:<target>] ... [SENDDONE] means the same. Blocks may sit anywhere in a reply and one reply may carry several; text outside them is delivered here as usual, and the tokens never appear in the delivered text. The target may also be written as a configured handoff alias, ${origin.platform}:<channel id>, or <#channel id>. Only ${origin.platform} channels configured in the gateway are allowed - never a DM or a thread, never another platform - and a refused target is posted here with the token removed. A post is sent once, when your answer is final, and a reply-threading token inside it is ignored. In Discord and Slack text, a channel link is <#channel id>.`,
 				]
 			: []),
